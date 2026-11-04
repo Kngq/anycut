@@ -198,6 +198,180 @@ Corrections to the research above, found while implementing:
 - The exact CapCut cache-key hash input is still unknown and doesn't matter for freecut: we use
   `sha1(kind:version:path:size:mtimeMs)`.
 
+## Research: how CapCut's effects and transitions interact with the timeline (2026-11-04)
+
+This covers the timeline side: dragging an effect or transition from the panel and what happens
+when it lands on a clip or a cut. How each effect renders is covered in
+`docs/capcut-effects-reimplementation.md`.
+
+**Method.** Sources were:
+- QML recovered from `libVECreator.dylib`. These are the same 2,041 files as `frontend.md`, kept in
+  the session scratchpad and not committed.
+- Log and metadata strings from the same library.
+- `en.po` labels.
+- The structure of local `draft_info.json` files.
+
+Confidence:
+- **Observed:** QML is read directly.
+- **Strings:** C++ log text and method names only. The C++ was not decompiled (Hopper still can't
+  load the library).
+- **Inferred:** reasoning from names.
+
+Nothing was tested in the running app.
+
+### 1. One drag pipeline; the timeline decides the outcome (observed)
+- **The card does no placement logic.** Every material card (media, effect, filter, transition,
+  sticker) is a `CommonItemView`. It starts a Qt drag with:
+  - `Drag.supportedActions: Qt.CopyAction` and `Drag.dragType: Drag.Automatic`.
+  - `Drag.hotSpot` at bottom-centre (`width/2, height`).
+  - `Drag.source` set to a C++ object from `viewModel.dragSource()`, which describes the resource.
+    No URL or MIME string is used.
+  - The drag starts after 5 px of movement. Touch mode uses a long press first.
+  - On drag start the card calls `grabDragger(item, w, h)` to snapshot itself for the ghost.
+- **Ghost window.** Outside the timeline, the snapshot follows the cursor in a frameless,
+  click-through window (`DragFllowItem.qml`):
+  - Cyan 2 px border, 8 px radius.
+  - With more than one item, a second card is rotated 3° behind it and a count badge shows "99+"
+    above 99.
+- **One drop area for the whole timeline.** `MainTimeLine.qml` has a single `DropArea` that only
+  forwards events to the canvas view-model:
+  - `dragEnter(source, urls)` returns whether the drop is accepted. This is what refuses an invalid
+    drop up front.
+  - `dragPositionChanged(source, x, y)` returns the **snapped x**. The QML then places the
+    follow-ghost at `snappedX - targetItemPoint.x`.
+  - `dragDrop(source, x, y)` commits the drop. Finder files take a separate path,
+    `dragDropOther(urls)`.
+  - `dragExit()` cancels.
+  - Near any edge, an auto-scroll timer runs.
+- **No per-clip drop targets.** Clips have no `DropArea`. Hit-testing for "which clip or which cut
+  am I over" happens in C++ from canvas coordinates. That keeps the decision in one place and
+  keeps drag performance independent of clip count.
+
+### 2. The ghost changes shape to show the drop result (observed)
+`MainTimeLineFollowSegments.qml` is the in-timeline ghost. Its view-model switches between three
+modes during a drag:
+
+| Mode | Shown | When (inferred from names and logs) |
+|---|---|---|
+| Normal: `trackItemModel` rows | Coloured bars at the exact length and track they'd occupy. A transition bar is a small icon chip. | Dropping into empty track space creates new segment(s), e.g. an effect or filter on its own track. |
+| `replaceMode` | The grabbed card image, rotated 8°, with a cyan "replace" badge | Media dragged over an existing clip; the drop replaces that clip's source. |
+| `insertSubSegmentMode` | The grabbed card image, not rotated | An effect dragged **onto a clip**; the drop attaches the effect to that clip. |
+
+Signals `enterReplaceMode_signal` and `enterInsertSubSegmentMode_signal` flip the mode while the
+pointer moves. The user sees before releasing whether the drop will make a new layer, replace a
+clip, or attach to a clip. Tooltip strings say the same: "Drag effect to the timeline" and "Drag
+this effect to the clip you want to apply it to".
+
+### 3. Effects: own track, or attached to a clip
+- **Own track (strings and draft schema).** An effect dropped in empty space becomes a
+  `segment_video_effect` on an effect track:
+  - It has its own `target_timerange` and a `render_index`. Tracks with an effect count are
+    `effect_track_cnt`.
+  - It is moved, trimmed and split like any clip. `MainTimeLineSegmentEffect`,
+    `...SegmentFilter` and `...SegmentPluginEffect` all extend the base `MainTimeLineSegment`.
+  - It applies to everything rendered below it for its duration.
+  - Filters behave the same way, as `segment_filter`.
+- **Attached to a clip (observed).** Dropped on a clip, the effect goes into that segment's
+  `video_effects` list, referenced through `extra_material_refs`, the same mechanism as
+  speed/canvas/animation materials. The video clip then shows:
+  - Header badges `Effect: <name> · edit` (multiple effects add a ▸ menu) and `Filter`
+    (`needEffectIconBadge`, `needFilterBadge`).
+  - Error badges `effectLost` / `filterLost` / `animationLost` when a resource file is missing.
+- **Editing an attached effect (observed).** Clicking the badge opens
+  `MainTimeLineSegmentVideoEffectEditing`:
+  - It is a full `MainTimeLineSegment`, so it is trimmable and cuttable (`segmentCutEnabled`).
+  - It is drawn over the clip with a 2 px border, only while selected, labelled
+    `Effect: <name> - editing`.
+  - So a clip-attached effect still has its own sub-range inside the clip, editable in place
+    without a separate track.
+- **Inspector.** Batch-selecting effects with different params shows "The selected effects have
+  different parameters…" and disables batch editing.
+
+### 4. Transitions belong to a cut, not a track (observed and strings)
+- **Drop target.** A transition can only be dropped on a cut between two adjacent video or photo
+  clips.
+  - Log strings: `handle drop transition`, `droppped resource is not transition`, `drop
+    transitioin but no video track`.
+  - Agent-tool docs say transitions are addressed by the **left-side segment_id**, so the
+    transition is stored on the outgoing clip.
+  - In the minidraft schema, a `segment_video` has a single `transition {name, effect_id,
+    duration}`.
+  - Overlay tracks gained transitions later ("You can now add transitions to overlay clips").
+- **Drawing (observed, `MainTimeLineSegmentTransition.qml`).**
+  - It is a small segment centred on the cut, using `transition.svg` 18×18. The icon hides below
+    20 px width.
+  - Translucent white fill, `White1A` border. It sits above clips (z 6, or 7 when selected) and has
+    trim handles.
+  - Neighbouring clips widen to make room via `leftTransAnimaratio` / `rightTranAnimaratio`. Their
+    in/out animation bars are measured against that widened width.
+- **Clips too short (observed and strings).**
+  - Error text: "Clips are too short for a transition. Create duplicate frames to add transition
+    and maintain the original length of clips."
+  - When accepted, `isOverlap` is set. Hatched `shadow_mask.png` regions labelled **"Duplicate
+    frame"** fill the part of the transition that has no real source frames, each capped at half
+    the transition's width.
+  - Otherwise it fails with "Video too short. Apply transition effect to a longer video." (also logged
+    as `seg_too_short`).
+  - `splitMainTrackToInsertTransition` shows that a transition can also be placed mid-clip by
+    splitting first.
+- **Inspector (observed, `TransitionSettingPanelView.qml`).**
+  - A Duration slider in seconds with 1 decimal, step `viewModel.stepSize` (fallback 0.1). The
+    slider bounds come from `minDuration` / `maxDuration`, which are clamped by the neighbouring clip
+    lengths (exact formula is in C++).
+  - **Default 0.5 s.** Double-click or the group reset sets it back to 0.5.
+  - Slider updates are throttled to 30 ms.
+  - **Apply all** copies the transition to every cut on the track.
+- **Missing resource.** A transition whose resource is gone shows "Transition loss" in place of the
+  icon.
+- **Downloads.** It shows a spinner while downloading and a red retry dot on failure.
+
+### 5. Card behaviours in the effect and transition panels (observed, `OnlineEffectItemView.qml`)
+- Hovering plays the animated cover (`image.playing`). `previewHovered(mouseX, width)` scrubs the
+  effect preview by pointer x.
+- The card shows a download arrow until the resource is downloaded. A favourite star appears on
+  hover.
+- A **"+" button (Add to track)** appears on hover once the resource is downloaded. It calls
+  `importClicked()`, a click-to-add alternative to dragging. The target is inferred as the
+  selected clip, or the playhead.
+
+### Takeaways for freecut
+freecut already has transitions (`Clip.transitionIn`, stored on the incoming clip) and clip effects
+(`Clip.effects`). The Effects and Transitions tabs in `MediaBin.tsx` currently apply them
+**only by click on the selected clip**. To match CapCut's interaction:
+
+1. **One payload, one decision point.**
+   - Add `EFFECT_DRAG_MIME` and `TRANSITION_DRAG_MIME` (JSON `{kind, type}`) next to
+     `ASSET_DRAG_MIME`. Make the effect and transition cards `draggable`.
+   - In `Timeline.tsx`, keep a single drop handler. Write a pure
+     `resolveDrop(project, payload, timeSec, trackIndex)` that returns `{kind:'attach', clipId}`,
+     `{kind:'transition', leftClipId, rightClipId}`, `{kind:'newTrack', start}`, or `null`.
+   - Test it with vitest.
+   - `onDragOver` calls it to set `dropEffect` ('none' rejects) and to pick the ghost style.
+     `onDrop` calls it again and commits through one store action.
+2. **Ghost states.** Mirror CapCut's three modes:
+   - A bar on a new lane for effects dropped in empty space.
+   - A clip highlight with a "+fx" chip for attach.
+   - A cut-point marker for transitions.
+   - Show the decision before release. Reject over audio tracks or non-adjacent clips.
+3. **Transition hit zone.** While a transition payload is dragged, snap to the nearest cut on a
+   video track within a pixel radius. CapCut's radius is in C++ and unknown; start at about 12 px.
+   - New transitions default to **0.5 s**, the CapCut default; freecut currently uses 1 s.
+   - Clamp to `min(leftDur, rightDur)`. Optionally offer a "Duplicate frame" freeze padding when
+     clips are too short, rather than refusing.
+4. **Attached-effect badges.** On clips with `effects.length`, show an `Effect: <name>` badge (▸ when
+   more than one). Clicking it selects the clip and scrolls the Inspector to that effect. Show a lost
+   badge if an effect type is unknown when loading an old project.
+5. **Later: effect tracks.** An effect segment with its own time range that applies to everything
+   below it is a model change: a new track type, plus preview and export compositing. Do this only
+   after drag-to-attach works. Keep "+ / click applies to the selected clip" as the fallback, like
+   CapCut's "Add to track" button.
+
+Open questions (C++ only):
+- The exact snap and hit radius for cuts.
+- How `minDuration` / `maxDuration` are derived.
+- Whether dropping an effect onto a clip that already has one adds to it or replaces it.
+- Effect track `render_index` ordering rules.
+
 ## Media management (implemented)
 
 ### Cache (`electron/main/cache.ts`)
