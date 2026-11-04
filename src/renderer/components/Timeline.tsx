@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useProjectStore } from '../state/projectStore'
 import { useLayoutStore, TRACK_HEIGHTS, type TrackHeightMode } from '../state/layoutStore'
-import { formatMMSS, projectDuration, type Clip, type MediaAsset, type ThumbnailCover, type Track } from '@shared/types'
+import { effectCatalogEntry, formatMMSS, projectDuration, TRANSITION_CATALOG, type Clip, type MediaAsset, type ThumbnailCover, type Track } from '@shared/types'
+import { resolveDrop, type DragPayload, type DropResolution } from '@shared/dropTargets'
 import { ASSET_DRAG_MIME, assetsFromPaths, droppedFilePaths, isMediaDrag } from '../media'
+import { activeDragPayload, endFxDrag, isFxDrag, readFxPayload } from '../dragPayload'
+import { useToastStore } from '../state/toastStore'
 
 /** Width of the sticky track label column; lanes and the ruler's 0s mark start after it. */
 const LABEL_WIDTH = 90
@@ -20,6 +23,20 @@ interface DragState {
   dx: number
   trackRowY: number[]
   trackRowIds: string[]
+}
+
+/** Live hover state of an effect/transition drag: what a drop here would do (the ghost). */
+interface FxDropState {
+  trackId: string
+  payload: DragPayload
+  resolution: DropResolution
+  /** Pointer x within the lane (px), for placing the reject chip. */
+  laneX: number
+}
+
+function payloadLabel(payload: DragPayload): string {
+  if (payload.kind === 'effect') return effectCatalogEntry(payload.type)?.label ?? payload.type
+  return TRANSITION_CATALOG.find((t) => t.type === payload.type)?.label ?? payload.type
 }
 
 interface TrimState {
@@ -257,6 +274,17 @@ function ToolButton({ icon, label, shortcut, active, disabled, onClick }: ToolBu
   )
 }
 
+function sameFxDrop(a: FxDropState, b: FxDropState): boolean {
+  if (a.trackId !== b.trackId || a.payload !== b.payload) return false
+  const ra = a.resolution
+  const rb = b.resolution
+  if (ra.kind !== rb.kind) return false
+  if (ra.kind === 'attach' && rb.kind === 'attach') return ra.clipId === rb.clipId
+  if (ra.kind === 'transition' && rb.kind === 'transition') return ra.rightClipId === rb.rightClipId && ra.duration === rb.duration
+  // Reject chips follow the pointer, so only skip tiny moves.
+  return ra.kind === 'reject' && rb.kind === 'reject' && ra.reason === rb.reason && Math.abs(a.laneX - b.laneX) < 4
+}
+
 export default function Timeline() {
   const project = useProjectStore((s) => s.project)
   const pxPerSecond = useProjectStore((s) => s.pxPerSecond)
@@ -277,6 +305,10 @@ export default function Timeline() {
   const rotateClip = useProjectStore((s) => s.rotateClip)
   const toggleClipFlipH = useProjectStore((s) => s.toggleClipFlipH)
   const undo = useProjectStore((s) => s.undo)
+  const addClipEffect = useProjectStore((s) => s.addClipEffect)
+  const setClipTransition = useProjectStore((s) => s.setClipTransition)
+  const focusEffect = useProjectStore((s) => s.focusEffect)
+  const pushToast = useToastStore((s) => s.push)
   const trackHeightMode = useLayoutStore((s) => s.trackHeight)
   const setTrackHeight = useLayoutStore((s) => s.setTrackHeight)
   const rowHeight = TRACK_HEIGHTS[trackHeightMode]
@@ -297,6 +329,22 @@ export default function Timeline() {
   const dragRef = useRef<DragState | null>(null)
   const [trim, setTrim] = useState<TrimState | null>(null)
   const [dropTrackId, setDropTrackId] = useState<string | null>(null)
+  const [fxDrop, setFxDrop] = useState<FxDropState | null>(null)
+
+  // An effect/transition drag can end anywhere (released over the bin, Esc, dropped outside the
+  // window); clear the ghost and the recorded payload whenever any drag finishes.
+  useEffect(() => {
+    const clear = () => {
+      setFxDrop(null)
+      endFxDrag()
+    }
+    window.addEventListener('dragend', clear)
+    window.addEventListener('drop', clear)
+    return () => {
+      window.removeEventListener('dragend', clear)
+      window.removeEventListener('drop', clear)
+    }
+  }, [])
   // Available width of the scroll container, tracked so the timeline can stretch to fill it
   // when the content is shorter than the panel (and still scroll when it's longer).
   const [wrapWidth, setWrapWidth] = useState(0)
@@ -354,7 +402,30 @@ export default function Timeline() {
     return hovered.type === wanted ? hovered : project.tracks.find((t) => t.type === wanted)
   }
 
+  /** One decision point for hover AND drop (CapCut's model): the same resolver result drives
+   *  the ghost and the commit, so what you see before releasing is what you get. */
+  function resolveFxAt(e: React.DragEvent, track: Track, payload: DragPayload): FxDropState {
+    const rect = bodyRef.current?.getBoundingClientRect()
+    const laneX = rect ? e.clientX - rect.left - LABEL_WIDTH : 0
+    const resolution = resolveDrop(useProjectStore.getState().project, payload, { trackId: track.id, time: timeAt(e.clientX), pxPerSecond })
+    return { trackId: track.id, payload, resolution, laneX }
+  }
+
+  function onFxDragOver(e: React.DragEvent, track: Track) {
+    const payload = activeDragPayload()
+    if (!payload) return
+    const next = resolveFxAt(e, track, payload)
+    if (next.resolution.kind !== 'reject') {
+      e.preventDefault() // accept: the browser shows the copy cursor and will fire drop
+      e.dataTransfer.dropEffect = 'copy'
+    } else {
+      e.dataTransfer.dropEffect = 'none'
+    }
+    setFxDrop((prev) => (prev && sameFxDrop(prev, next) ? prev : next))
+  }
+
   function onLaneDragOver(e: React.DragEvent, track: Track) {
+    if (isFxDrag(e.dataTransfer)) return onFxDragOver(e, track)
     if (!isMediaDrag(e.dataTransfer)) return
     e.preventDefault() // required, or the browser refuses the drop
     e.dataTransfer.dropEffect = 'copy'
@@ -362,10 +433,35 @@ export default function Timeline() {
   }
 
   function onLaneDragLeave(e: React.DragEvent) {
-    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropTrackId(null)
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+      setDropTrackId(null)
+      setFxDrop(null)
+    }
+  }
+
+  function onFxDrop(e: React.DragEvent, track: Track) {
+    e.preventDefault()
+    const payload = readFxPayload(e.dataTransfer)
+    setFxDrop(null)
+    endFxDrag()
+    if (!payload) return
+    const { resolution } = resolveFxAt(e, track, payload)
+    if (resolution.kind === 'attach' && payload.kind === 'effect') {
+      addClipEffect(resolution.clipId, payload.type)
+      // Reveal the new effect in the Inspector, like CapCut selecting the segment it landed on.
+      const clip = useProjectStore.getState().project.tracks.flatMap((t) => t.clips).find((c) => c.id === resolution.clipId)
+      const added = clip?.kind === 'media' ? clip.effects?.[clip.effects.length - 1] : undefined
+      if (added) focusEffect(resolution.clipId, added.id)
+    } else if (resolution.kind === 'transition' && payload.kind === 'transition') {
+      setClipTransition(resolution.rightClipId, { type: payload.type, duration: resolution.duration })
+      selectClip(resolution.rightClipId)
+    } else if (resolution.kind === 'reject') {
+      pushToast('info', resolution.reason)
+    }
   }
 
   async function onLaneDrop(e: React.DragEvent, track: Track) {
+    if (isFxDrag(e.dataTransfer)) return onFxDrop(e, track)
     if (!isMediaDrag(e.dataTransfer)) return
     e.preventDefault()
     setDropTrackId(null)
@@ -506,6 +602,30 @@ export default function Timeline() {
     window.addEventListener('mouseup', onUp)
   }
 
+  /** CapCut-style attached-effect badge: the first effect's name plus a count; click to reveal it
+   *  in the Inspector. An effect whose type this build doesn't know is flagged as lost. */
+  function renderEffectBadge(clip: Extract<Clip, { kind: 'media' }>) {
+    const effects = clip.effects ?? []
+    const first = effects[0]
+    const entry = effectCatalogEntry(first.type)
+    const lost = effects.some((fx) => !effectCatalogEntry(fx.type))
+    const names = effects.map((fx) => effectCatalogEntry(fx.type)?.label ?? `${fx.type} (lost)`)
+    return (
+      <span
+        className={`clip-effect-badge ${lost ? 'lost' : ''}`}
+        title={`Effects: ${names.join(', ')}. Click to edit.`}
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation()
+          focusEffect(clip.id, first.id)
+        }}
+      >
+        {lost ? '⚠ ' : ''}Effect: {entry?.label ?? 'Lost effect'}
+        {effects.length > 1 ? ` +${effects.length - 1}` : ''}
+      </span>
+    )
+  }
+
   function renderClip(clip: Clip, track: Track) {
     const isDraggingThis = drag?.clipId === clip.id
     const left = isDraggingThis ? drag.clipStartPx + drag.dx : clip.start * pxPerSecond
@@ -544,7 +664,7 @@ export default function Timeline() {
     return (
       <div
         key={clip.id}
-        className={`clip ${clipClassName(clip, track)} ${hasCover ? 'has-cover' : ''} ${selectedClipId === clip.id ? 'selected' : ''} ${offline ? 'offline' : ''}`}
+        className={`clip ${clipClassName(clip, track)} ${hasCover ? 'has-cover' : ''} ${selectedClipId === clip.id ? 'selected' : ''} ${offline ? 'offline' : ''} ${fxDrop?.resolution.kind === 'attach' && fxDrop.resolution.clipId === clip.id ? 'drop-attach' : ''}`}
         style={{ left, width, zIndex: isDraggingThis ? 10 : 1 }}
         onMouseDown={(e) => onClipPointerDown(e, clip, track)}
         title={clip.kind === 'text' ? clip.text : `${name} · ${clip.duration.toFixed(1)}s`}
@@ -563,8 +683,12 @@ export default function Timeline() {
         <div className="clip-header">
           {clip.transitionIn && track.type === 'video' && <span className="clip-transition-badge">⤬</span>}
           {offline && <span className="clip-offline-tag">Offline</span>}
+          {clip.kind === 'media' && clip.effects && clip.effects.length > 0 && renderEffectBadge(clip)}
           <span className="clip-title">{headerLabel}</span>
         </div>
+        {fxDrop?.resolution.kind === 'attach' && fxDrop.resolution.clipId === clip.id && (
+          <div className="clip-drop-chip">+fx {payloadLabel(fxDrop.payload)}</div>
+        )}
         {hasWaveform && anyVisible && (
           <WaveformCanvas
             peaks={asset!.waveform!.peaks}
@@ -658,7 +782,7 @@ export default function Timeline() {
         </div>
         {project.tracks.map((track) => (
           <div
-            className={`track-row th-${trackHeightMode} ${dropTrackId === track.id ? 'drop-active' : ''}`}
+            className={`track-row th-${trackHeightMode} ${dropTrackId === track.id ? 'drop-active' : ''} ${fxDrop?.trackId === track.id && fxDrop.resolution.kind === 'reject' ? 'drop-reject' : ''}`}
             key={track.id}
             style={{ height: rowHeight }}
             onDragOver={(e) => onLaneDragOver(e, track)}
@@ -675,6 +799,18 @@ export default function Timeline() {
               onMouseDown={() => selectClip(null)}
             >
               {track.clips.map((clip) => renderClip(clip, track))}
+              {fxDrop?.trackId === track.id && fxDrop.resolution.kind === 'transition' && (
+                <div className="cut-drop-marker" style={{ left: fxDrop.resolution.cutTime * pxPerSecond }}>
+                  <span className="cut-drop-chip">
+                    {payloadLabel(fxDrop.payload)} · {fxDrop.resolution.duration.toFixed(1)}s
+                  </span>
+                </div>
+              )}
+              {fxDrop?.trackId === track.id && fxDrop.resolution.kind === 'reject' && (
+                <div className="drop-reject-chip" style={{ left: Math.max(0, fxDrop.laneX) }}>
+                  {fxDrop.resolution.reason}
+                </div>
+              )}
             </div>
           </div>
         ))}

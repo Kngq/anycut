@@ -142,3 +142,45 @@ describe('projectStore — media management', () => {
     expect(override()).toBeUndefined()
   })
 })
+
+describe('projectStore — transitions', () => {
+  beforeEach(() => {
+    useProjectStore.getState().newProject()
+  })
+
+  /** Two back-to-back clips on the main video track; returns the second (transition-eligible) clip id. */
+  function seedTwoClips(): string {
+    seedOneClip()
+    const st = useProjectStore.getState()
+    const vt = st.project.tracks.find((t) => t.type === 'video')!
+    st.addMediaClipToTrack(vt.id, st.project.assets[0], 10)
+    return useProjectStore.getState().selectedClipId!
+  }
+
+  function transitionOf(clipId: string) {
+    return useProjectStore.getState().project.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId)?.transitionIn
+  }
+
+  it('setClipTransition sets type and duration as ONE undo step', () => {
+    const id = seedTwoClips()
+    const pastBefore = useProjectStore.getState().past.length
+    useProjectStore.getState().setClipTransition(id, { type: 'wipeLeft', duration: 0.5 })
+    expect(transitionOf(id)).toEqual({ type: 'wipeLeft', duration: 0.5 })
+    expect(useProjectStore.getState().past.length).toBe(pastBefore + 1)
+    useProjectStore.getState().undo()
+    expect(transitionOf(id)).toBeUndefined()
+  })
+
+  it('setClipTransition is a no-op on the first clip', () => {
+    const first = seedOneClip()
+    useProjectStore.getState().setClipTransition(first, { type: 'crossfade', duration: 0.5 })
+    expect(transitionOf(first)).toBeUndefined()
+  })
+
+  it('setTransition changes the duration but keeps the type', () => {
+    const id = seedTwoClips()
+    useProjectStore.getState().setClipTransition(id, { type: 'dipToBlack', duration: 0.5 })
+    useProjectStore.getState().setTransition(id, 1.2)
+    expect(transitionOf(id)).toEqual({ type: 'dipToBlack', duration: 1.2 })
+  })
+})

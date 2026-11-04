@@ -95,6 +95,9 @@ Recently added (this track of work — all on `main`, pushed to github.com/Kngq/
     transcode, 720p proxies, seek-based filmstrips, missing-media relink, atomic save + `.bak` +
     lock, per-clip `sourceOverride`, working background removal. See "Media management
     (implemented)".
+17. **Drag-and-drop effects and transitions (CapCut-derived)** — drag a card from the Effects or
+    Transitions tab onto the timeline; the drop is previewed before release. See "Effects and
+    transitions drag-and-drop (implemented)".
 
 ## Research: how CapCut manages media (reverse-engineered, 2026-11-03)
 
@@ -334,7 +337,11 @@ this effect to the clip you want to apply it to".
   `importClicked()`, a click-to-add alternative to dragging. The target is inferred as the
   selected clip, or the playhead.
 
-### Takeaways for freecut
+### Takeaways for freecut: status
+Takeaways 1–4 are **implemented and verified** (2026-11-04). Takeaway 5 (effect tracks) is still
+"Later". See "Effects and transitions drag-and-drop (implemented)" below for what differs from the
+plan. The original recommendations follow.
+
 freecut already has transitions (`Clip.transitionIn`, stored on the incoming clip) and clip effects
 (`Clip.effects`). The Effects and Transitions tabs in `MediaBin.tsx` currently apply them
 **only by click on the selected clip**. To match CapCut's interaction:
@@ -371,6 +378,40 @@ Open questions (C++ only):
 - How `minDuration` / `maxDuration` are derived.
 - Whether dropping an effect onto a clip that already has one adds to it or replaces it.
 - Effect track `render_index` ordering rules.
+
+## Effects and transitions drag-and-drop (implemented)
+
+- **Decision point:** `src/shared/dropTargets.ts` `resolveDrop(project, payload, {trackId, time,
+  pxPerSecond})`, pure and tested (`dropTargets.test.ts`). The Timeline calls it on every
+  `dragover` (ghost + `dropEffect`) and again on `drop` (commit), so the preview always matches.
+  It returns `attach`, `transition` or `reject` **with a reason** (not `null`), and the reason is
+  shown next to the pointer.
+- **Payload:** `EFFECT_DRAG_MIME` / `TRANSITION_DRAG_MIME` carry JSON `{type}`. Browsers hide
+  drag data during `dragover`, so `src/renderer/dragPayload.ts` also records the active payload
+  for the hover preview; the drop reads the real data. The drag image is anchored at the card's
+  bottom-centre, like CapCut.
+- **Effects:** attach only to media clips on video tracks (any video track), appended to the
+  stack. The drop selects the clip and reveals the new effect in the Inspector. Empty space,
+  audio and text tracks are rejected (no effect tracks yet, so there is no `newTrack` result).
+- **Transitions:** main video track only (same rule as `canHaveTransition`). Snap to the nearest
+  cut within `CUT_SNAP_PX = 12` px; with an existing overlap, the cut is its midpoint. Stored on
+  the right clip's `transitionIn`. Duration keeps an existing transition's length, else 0.5 s,
+  clamped to `min(left, right)`; below 0.1 s it's rejected. No "Duplicate frame" padding.
+- **Store:** `setClipTransition(clipId, {type, duration})` sets both in one undo step (used by the
+  drop and by click-to-apply, which now also defaults to 0.5 s). Fixed: `setTransition` used to
+  reset the type to crossfade whenever the duration changed.
+- **Ghosts (`Timeline.tsx`, CSS at the end of `styles.css`):** `.clip.drop-attach` + "+fx <name>"
+  chip; `.cut-drop-marker` with "<name> · 0.5s"; `.track-row.drop-reject` + `.drop-reject-chip`.
+  Cleared on `dragleave`, and on window `dragend`/`drop`.
+- **Badges:** media clips with effects show `Effect: <first> +N` in the header (title lists all;
+  ⚠ and amber if any type isn't in `EFFECT_CATALOG`). Clicking calls `focusEffect`: selects the
+  clip, the Inspector switches to the Video tab, scrolls to `[data-effect-id]` and flashes it.
+- **Click-to-apply is kept** as the fallback. Cards stay draggable even when no clip is selected.
+- **Verified:** tsc, 90 vitest tests, `vite build`, and in the running app via the CDP driver
+  with synthetic DragEvents: attach ghost + drop + badge + Inspector focus, reject chip over
+  empty space (drop not accepted), transition rejected 2 s from a cut and snapped within 5 px,
+  drop gives `wipeLeft` 0.5 s in one undo step. Screenshots `.dev-shots/dnd-0*.png`. A real
+  mouse drag (OS drag session) was not exercised by the driver.
 
 ## Media management (implemented)
 

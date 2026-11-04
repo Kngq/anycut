@@ -15,6 +15,8 @@ import {
 } from '@shared/types'
 import { ASSET_DRAG_MIME, assetsFromPaths, droppedFilePaths } from '../media'
 import { locateMissing } from '../projectIO'
+import { endFxDrag, startFxDrag } from '../dragPayload'
+import { DEFAULT_TRANSITION_SECONDS } from '@shared/dropTargets'
 
 function TabIcon({ children }: { children: ReactNode }) {
   return (
@@ -147,8 +149,7 @@ export default function MediaBin() {
   const selectedClipId = useProjectStore((s) => s.selectedClipId)
   const addClipEffect = useProjectStore((s) => s.addClipEffect)
   const removeClipEffect = useProjectStore((s) => s.removeClipEffect)
-  const setTransition = useProjectStore((s) => s.setTransition)
-  const setTransitionType = useProjectStore((s) => s.setTransitionType)
+  const setClipTransition = useProjectStore((s) => s.setClipTransition)
   const [dropActive, setDropActive] = useState(false)
   const [activeTab, setActiveTab] = useState<TabId>('media')
 
@@ -188,12 +189,10 @@ export default function MediaBin() {
 
   function handleApplyTransition(type: TransitionType) {
     if (!selectedClipId) return
-    // Give the transition a sensible default length if the clip has none yet, then set its
-    // type. setTransition/setTransitionType are no-ops on clips that can't carry a transition.
-    if (!selectedClip?.transitionIn || selectedClip.transitionIn.duration <= 0) {
-      setTransition(selectedClipId, 1)
-    }
-    setTransitionType(selectedClipId, type)
+    // One undo step: keep an existing transition's length, else CapCut's 0.5 s default.
+    // A no-op on clips that can't carry a transition.
+    const existing = selectedClip?.transitionIn?.duration ?? 0
+    setClipTransition(selectedClipId, { type, duration: existing > 0 ? existing : DEFAULT_TRANSITION_SECONDS })
   }
 
   function handleRemoveAsset(asset: MediaAsset, e: React.MouseEvent) {
@@ -343,8 +342,8 @@ export default function MediaBin() {
         <div className="media-bin-body">
           <div className="empty-hint" style={{ padding: '0 0 8px' }}>
             {selectedClip && selectedClip.kind === 'media'
-              ? 'Click an effect to add it to the selected clip. Previews are live.'
-              : 'Preview effects below. Select a video/image clip to apply one.'}
+              ? 'Drag an effect onto a clip, or click to add it to the selected clip.'
+              : 'Drag an effect onto a video or image clip, or select a clip and click.'}
           </div>
           <div className="fx-grid">
             {EFFECT_CATALOG.map((entry) => {
@@ -353,8 +352,11 @@ export default function MediaBin() {
                 <button
                   key={entry.type}
                   className={`fx-card ${applicable ? '' : 'fx-card-disabled'}`}
+                  draggable
+                  onDragStart={(e) => startFxDrag(e, { kind: 'effect', type: entry.type })}
+                  onDragEnd={endFxDrag}
                   onClick={() => applicable && handleApplyEffect(entry.type)}
-                  title={applicable ? `Add "${entry.label}"` : `Preview of "${entry.label}" (select a clip to apply)`}
+                  title={applicable ? `Add "${entry.label}" (or drag onto a clip)` : `Drag "${entry.label}" onto a clip`}
                 >
                   <EffectPreview type={entry.type} />
                   <span className="fx-card-label">{entry.label}</span>
@@ -382,8 +384,8 @@ export default function MediaBin() {
         <div className="media-bin-body">
           <div className="empty-hint" style={{ padding: '0 0 8px' }}>
             {canHaveTransition(project, selectedClipId)
-              ? 'Click a transition to apply it to the selected clip. Previews loop A→B.'
-              : 'Preview transitions below. Select a clip on the main video track (not the first) to apply one.'}
+              ? 'Drag a transition onto a cut, or click to apply it to the selected clip.'
+              : 'Drag a transition onto a cut between two clips on the main video track.'}
           </div>
           <div className="fx-grid">
             {TRANSITION_CATALOG.map((t) => {
@@ -393,8 +395,11 @@ export default function MediaBin() {
                 <button
                   key={t.type}
                   className={`fx-card ${active ? 'active' : ''} ${applicable ? '' : 'fx-card-disabled'}`}
+                  draggable
+                  onDragStart={(e) => startFxDrag(e, { kind: 'transition', type: t.type })}
+                  onDragEnd={endFxDrag}
                   onClick={() => applicable && handleApplyTransition(t.type)}
-                  title={applicable ? `Apply "${t.label}"` : `Preview of "${t.label}" (select an eligible clip to apply)`}
+                  title={applicable ? `Apply "${t.label}" (or drag onto a cut)` : `Drag "${t.label}" onto a cut between two clips`}
                 >
                   <TransitionPreview type={t.type} />
                   <span className="fx-card-label">{t.label}</span>

@@ -17,6 +17,7 @@ import {
   type SpeedKeyframe,
   type Track,
   type TrackType,
+  type Transition,
   type TransitionType
 } from '@shared/types'
 
@@ -32,6 +33,9 @@ interface ProjectState {
   /** Transient: ids of assets whose source file is missing on disk (moved/renamed/unplugged).
    *  Set by the post-open media check; cleared per asset when it's relinked. Never serialized. */
   missingAssetIds: string[]
+  /** Transient: an effect the Inspector should reveal (set by clicking a clip's effect badge).
+   *  `nonce` makes repeat clicks on the same effect re-trigger the scroll. */
+  effectFocus: { clipId: string; effectId: string; nonce: number } | null
   playhead: number
   isPlaying: boolean
   pxPerSecond: number
@@ -99,6 +103,9 @@ interface ProjectState {
   setTransition: (clipId: string, duration: number) => void
   /** Changes the transition type (crossfade/slide/wipe/…) without touching its duration; a
    *  no-op when the clip has no transitionIn yet (set a duration first). */
+  /** Sets type AND duration in one undo step (drag-drop and the Transitions tab); undefined removes it.
+   *  Same guard as setTransition: main video track, not the first clip. */
+  setClipTransition: (clipId: string, transition: Transition | undefined) => void
   setTransitionType: (clipId: string, type: TransitionType) => void
   /** Appends a default-param effect of `type` to a clip's effect stack. */
   addClipEffect: (clipId: string, type: ClipEffectType) => void
@@ -113,6 +120,8 @@ interface ProjectState {
   setClipSourceOverride: (clipId: string, override: MediaClip['sourceOverride']) => void
 
   selectClip: (clipId: string | null) => void
+  /** Selects the clip and asks the Inspector to reveal one of its effects. */
+  focusEffect: (clipId: string, effectId: string) => void
   /** Sets (or clears, with null) the asset previewed standalone in the Preview panel. */
   setPreviewAsset: (assetId: string | null) => void
   /** Changes the output canvas resolution (aspect ratio). Keeps fps. */
@@ -266,6 +275,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
   selectedClipId: null,
   previewAssetId: null,
   missingAssetIds: [],
+  effectFocus: null,
   playhead: 0,
   isPlaying: false,
   pxPerSecond: 60,
@@ -659,10 +669,27 @@ export const useProjectStore = create<ProjectState>((set) => ({
       const project = updateTrack(s.project, found.track.id, (t) => {
         const withPatch = {
           ...t,
-          clips: t.clips.map((c) => (c.id === clipId ? { ...c, transitionIn: duration > 0 ? { type: 'crossfade' as const, duration } : undefined } : c))
+          // Keep the clip's current transition type: the Inspector's duration slider calls this on
+          // every move, and resetting to crossfade threw away a dropped wipe/slide/etc.
+          clips: t.clips.map((c) =>
+            c.id === clipId ? { ...c, transitionIn: duration > 0 ? { type: c.transitionIn?.type ?? ('crossfade' as const), duration } : undefined } : c
+          )
         }
         return repackVideoTrack(withPatch)
       })
+      return { project, dirty: true, ...recordPast(s) }
+    }),
+
+  setClipTransition: (clipId, transition) =>
+    set((s) => {
+      if (!canHaveTransition(s.project, clipId)) return {}
+      const found = findClip(s.project, clipId)!
+      const project = updateTrack(s.project, found.track.id, (t) =>
+        repackVideoTrack({
+          ...t,
+          clips: t.clips.map((c) => (c.id === clipId ? { ...c, transitionIn: transition && transition.duration > 0 ? transition : undefined } : c))
+        })
+      )
       return { project, dirty: true, ...recordPast(s) }
     }),
 
@@ -854,6 +881,8 @@ export const useProjectStore = create<ProjectState>((set) => ({
       return { project, dirty: true, ...recordPast(s) }
     }),
 
+  focusEffect: (clipId, effectId) =>
+    set({ selectedClipId: clipId, previewAssetId: null, effectFocus: { clipId, effectId, nonce: Date.now() } }),
   selectClip: (clipId) => set((s) => ({ selectedClipId: clipId, previewAssetId: clipId ? null : s.previewAssetId })),
   setPreviewAsset: (assetId) => set({ previewAssetId: assetId, isPlaying: false }),
   setCanvasSize: (width, height) =>

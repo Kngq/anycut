@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { canMergeWithNext, useProjectStore } from '../state/projectStore'
 import { useLayoutStore } from '../state/layoutStore'
 import BackgroundRemovalButton from './BackgroundRemovalButton'
@@ -166,7 +166,7 @@ function EffectFields({
       {effects.map((effect) => {
         const entry = effectCatalogEntry(effect.type)
         return (
-          <div key={effect.id} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: 6, marginBottom: 6 }}>
+          <div key={effect.id} className="fx-field" data-effect-id={effect.id} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: 6, marginBottom: 6 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
               <strong style={{ fontSize: 12 }}>{entry?.label ?? effect.type}</strong>
               <button title="Remove effect" onClick={() => onRemove(effect.id)}>
@@ -220,6 +220,25 @@ export default function Inspector() {
   const useProxies = useLayoutStore((s) => s.useProxies)
   const setUseProxies = useLayoutStore((s) => s.setUseProxies)
   const [tab, setTab] = useState<'video' | 'speed' | 'animation'>('video')
+  const effectFocus = useProjectStore((s) => s.effectFocus)
+
+  // A clip's effect badge (or a drop onto a clip) asks to reveal one effect: switch to the Video
+  // tab, then scroll its row into view and flash it once it has rendered.
+  useEffect(() => {
+    if (effectFocus) setTab('video')
+  }, [effectFocus])
+  useEffect(() => {
+    if (!effectFocus || tab !== 'video') return
+    const raf = requestAnimationFrame(() => {
+      const row = document.querySelector<HTMLElement>(`[data-effect-id="${CSS.escape(effectFocus.effectId)}"]`)
+      if (!row) return
+      row.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+      row.classList.remove('focus-flash')
+      void row.offsetWidth // restart the animation on repeat clicks
+      row.classList.add('focus-flash')
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [effectFocus, tab])
   const removeClip = useProjectStore((s) => s.removeClip)
   const mergeWithNext = useProjectStore((s) => s.mergeWithNext)
   const setTransition = useProjectStore((s) => s.setTransition)
