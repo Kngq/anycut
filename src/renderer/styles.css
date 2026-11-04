@@ -8,6 +8,8 @@
   --text: #e6e6ea;
   --text-dim: #9999a3;
   --accent: #6c7bff;
+  --speed-accent: #5ac8e0;
+  --premium: #7c5cff;
   --track-video: #3a4a7a;
   --track-audio: #3a7a5a;
   --track-text: #7a5a3a;
@@ -1066,29 +1068,31 @@ canvas.preview-canvas {
 /* Inspector tabs (Video / Adjust Speed / Animation) for a selected media clip. */
 .inspector-tabs {
   display: flex;
-  gap: 2px;
-  margin: 0 0 12px;
+  gap: 16px;
+  margin: 0 0 20px;
+  padding-bottom: 10px;
   border-bottom: 1px solid var(--border);
 }
 
 .inspector-tab {
-  flex: 1;
-  padding: 6px 4px;
+  flex: 0 0 auto;
+  padding: 2px 0;
   border: none;
-  border-bottom: 2px solid transparent;
   background: transparent;
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 13px;
   cursor: pointer;
 }
 
 .inspector-tab:hover {
   color: var(--text);
+  background: transparent;
 }
 
+/* Active tab: ONLY the text color changes to the cyan accent — no background, no underline. */
 .inspector-tab.active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
+  color: var(--speed-accent);
+  background: transparent;
 }
 
 /* Project/timeline details (shown in the Inspector when nothing is selected). */
@@ -1139,4 +1143,287 @@ canvas.preview-canvas {
 .caption-notice strong {
   display: block;
   margin-bottom: 2px;
+}
+
+/* ───────────────────────── Speed inspector panel ─────────────────────────
+   Dark, flat, left-aligned layout matching the CapCut-style spec. Cyan accent for active
+   states; violet for the small premium badge/gem. */
+.speed-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  padding: 2px 2px 8px;
+}
+
+/* Sub-tab pill/segment row. */
+.speed-subtabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.speed-subtab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.speed-subtab:hover {
+  color: #fff;
+  background: transparent;
+}
+
+/* Active sub-tab: a slightly lighter gray rounded pill. */
+.speed-subtab.active {
+  background: #3a3a3a;
+  color: #fff;
+}
+
+/* Small violet "N uses" badge next to the Curve label. */
+.speed-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--premium);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.speed-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.speed-label {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.speed-subvalue {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-top: -4px;
+}
+
+/* Slider + numeric stepper on one row. */
+.speed-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.speed-slider-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  height: 24px;
+}
+
+/* Base range styling: thin track, white circular thumb. */
+.speed-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 24px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.speed-slider::-webkit-slider-runnable-track {
+  height: 2px;
+  border-radius: 2px;
+  background: #4a4a52;
+}
+
+.speed-slider.dashed::-webkit-slider-runnable-track {
+  height: 0;
+  background: transparent;
+  border-top: 2px dashed #5a5a62;
+}
+
+.speed-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -6px;
+  border-radius: 50%;
+  background: #fff;
+  border: none;
+}
+
+/* Duration slider: triangular arrow handle pointing right instead of a circle. */
+.speed-slider.dashed::-webkit-slider-thumb {
+  width: 0;
+  height: 0;
+  margin-top: -7px;
+  border-radius: 0;
+  background: transparent;
+  border-top: 7px solid transparent;
+  border-bottom: 7px solid transparent;
+  border-left: 11px solid #fff;
+}
+
+/* Evenly-spaced tick marks under the Speed track. */
+.speed-ticks {
+  position: absolute;
+  left: 7px;
+  right: 7px;
+  top: 50%;
+  display: flex;
+  justify-content: space-between;
+  pointer-events: none;
+}
+
+.speed-tick {
+  width: 1px;
+  height: 8px;
+  margin-top: -4px;
+  background: #5a5a62;
+}
+
+/* Dark rounded numeric box + stacked chevron stepper. */
+.num-stepper {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.num-stepper-value {
+  display: inline-flex;
+  align-items: center;
+  min-width: 56px;
+  justify-content: center;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: #2a2a30;
+  color: #fff;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.num-stepper-buttons {
+  display: flex;
+  flex-direction: column;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #2a2a30;
+}
+
+.num-stepper-buttons button {
+  width: 22px;
+  height: 14px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.num-stepper-buttons button:hover {
+  color: #fff;
+  background: #3a3a42;
+}
+
+/* Toggle rows (Change audio pitch, Reverse). */
+.speed-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.toggle-switch {
+  position: relative;
+  width: 40px;
+  height: 22px;
+  border: none;
+  border-radius: 999px;
+  background: #3a3a42;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s ease;
+}
+
+.toggle-switch.on {
+  background: var(--speed-accent);
+}
+
+.toggle-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: left 0.15s ease;
+}
+
+.toggle-switch.on .toggle-knob {
+  left: 21px;
+}
+
+/* Speed-curve editor rows (Curve sub-tab). */
+.speed-curve-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.speed-curve-row input {
+  width: 72px;
+}
+
+.speed-add-point {
+  width: 100%;
+  margin-top: 4px;
+}
+
+/* Disabled/locked premium row. */
+.speed-locked-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  opacity: 0.45;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.speed-checkbox {
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--text-dim);
+  border-radius: 3px;
+  flex: 0 0 auto;
+}
+
+.speed-locked-label {
+  color: var(--text);
+}
+
+.speed-gem {
+  color: var(--premium);
+  font-size: 11px;
+}
+
+.speed-locked-help {
+  color: var(--text-dim);
+  flex-basis: 100%;
 }

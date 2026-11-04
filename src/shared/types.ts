@@ -397,6 +397,9 @@ export interface MediaClip extends ClipBase {
   speed: number // constant-speed multiplier, default 1; ignored when speedKeyframes has >=2 points
   speedKeyframes?: SpeedKeyframe[]
   reversed: boolean // plays the (speed-adjusted) source range back to front
+  /** When true, speed changes also shift audio pitch (asetrate) instead of preserving it
+   *  (atempo). Optional/absent ⇒ preserve pitch (the default). */
+  changeAudioPitch?: boolean
   /** Holds a single source frame (at trimIn) for `duration` seconds. When true, trimIn/trimOut
    *  stay pinned together and `duration` is an authored value, not derived from trim/speed. */
   frozen: boolean

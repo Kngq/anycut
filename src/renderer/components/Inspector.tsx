@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { canMergeWithNext, useProjectStore } from '../state/projectStore'
 import { useLayoutStore } from '../state/layoutStore'
 import BackgroundRemovalButton from './BackgroundRemovalButton'
+import SpeedPanel from './SpeedPanel'
 import {
   EFFECT_CATALOG,
   FONT_CATALOG,
@@ -304,7 +305,7 @@ export default function Inspector() {
       {showTabs && (
         <div className="inspector-tabs">
           <button className={`inspector-tab ${tab === 'video' ? 'active' : ''}`} onClick={() => setTab('video')}>Video</button>
-          <button className={`inspector-tab ${tab === 'speed' ? 'active' : ''}`} onClick={() => setTab('speed')}>Adjust Speed</button>
+          <button className={`inspector-tab ${tab === 'speed' ? 'active' : ''}`} onClick={() => setTab('speed')}>Speed</button>
           <button className={`inspector-tab ${tab === 'animation' ? 'active' : ''}`} onClick={() => setTab('animation')}>Animation</button>
         </div>
       )}
@@ -382,114 +383,15 @@ export default function Inspector() {
         </>
       )}
 
-      {track.type === 'video' && clip.kind === 'media' && showSpeedTab && (() => {
-        const hasCurve = (clip.speedKeyframes?.length ?? 0) >= 2
-        const curve = clip.speedKeyframes ?? []
-
-        function updateCurve(next: SpeedKeyframe[]) {
-          setClipSpeedKeyframes(clip.id, next)
-        }
-
-        return (
-          <>
-            <div className="field-row">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={hasCurve}
-                  onChange={(e) => {
-                    if (e.target.checked) {
-                      updateCurve([
-                        { time: clip.trimIn, speed: clip.speed },
-                        { time: clip.trimOut, speed: clip.speed }
-                      ])
-                    } else {
-                      setClipSpeedKeyframes(clip.id, undefined)
-                    }
-                  }}
-                />{' '}
-                Use speed curve
-              </label>
-            </div>
-
-            {hasCurve ? (
-              <div className="field-row">
-                <label>Speed curve (source time → speed)</label>
-                {curve.map((kf, i) => (
-                  <div key={i} style={{ display: 'flex', gap: 4, marginBottom: 4, alignItems: 'center' }}>
-                    <input
-                      type="number"
-                      step={0.1}
-                      value={kf.time}
-                      style={{ width: 64 }}
-                      title="Source-relative time (seconds)"
-                      onChange={(e) => {
-                        const next = [...curve]
-                        next[i] = { ...next[i], time: Number(e.target.value) }
-                        updateCurve(next)
-                      }}
-                    />
-                    <input
-                      type="number"
-                      step={0.05}
-                      min={0.1}
-                      max={4}
-                      value={kf.speed}
-                      style={{ width: 64 }}
-                      title="Speed multiplier"
-                      onChange={(e) => {
-                        const next = [...curve]
-                        next[i] = { ...next[i], speed: Number(e.target.value) }
-                        updateCurve(next)
-                      }}
-                    />
-                    <button
-                      disabled={curve.length <= 2}
-                      title="Remove point"
-                      onClick={() => updateCurve(curve.filter((_, idx) => idx !== i))}
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
-                <button
-                  style={{ width: '100%' }}
-                  onClick={() => {
-                    const a = curve[curve.length - 2]
-                    const b = curve[curve.length - 1]
-                    updateCurve([...curve, { time: (a.time + b.time) / 2, speed: (a.speed + b.speed) / 2 }])
-                  }}
-                >
-                  + Add point
-                </button>
-              </div>
-            ) : (
-              <div className="field-row">
-                <label>Speed ({clip.speed.toFixed(2)}x)</label>
-                <input
-                  type="range"
-                  min={0.1}
-                  max={4}
-                  step={0.05}
-                  value={clip.speed}
-                  onChange={(e) => setClipSpeed(clip.id, Number(e.target.value))}
-                />
-              </div>
-            )}
-
-            <div className="field-row">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={clip.reversed}
-                  onChange={(e) => setClipReversed(clip.id, e.target.checked)}
-                />{' '}
-                Reversed
-              </label>
-            </div>
-          </>
-        )
-      })()}
+      {track.type === 'video' && clip.kind === 'media' && showSpeedTab && (
+        <SpeedPanel
+          clip={clip}
+          onSpeed={(s) => setClipSpeed(clip.id, s)}
+          onSpeedKeyframes={(kfs) => setClipSpeedKeyframes(clip.id, kfs)}
+          onReversed={(r) => setClipReversed(clip.id, r)}
+          onChangeAudioPitch={(v) => updateMediaClipProps(clip.id, { changeAudioPitch: v })}
+        />
+      )}
 
       {clip.kind === 'media' && showAnimationTab && (
         <TransformFields transform={clip.transform} duration={clip.duration} onChange={(t) => setClipTransform(clip.id, t)} />

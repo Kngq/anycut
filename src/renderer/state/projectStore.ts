@@ -95,7 +95,7 @@ interface ProjectState {
   /** Patches one numeric param of one effect instance. */
   updateClipEffectParam: (clipId: string, effectId: string, key: string, value: number) => void
   updateTextClip: (clipId: string, patch: Record<string, unknown>) => void
-  updateMediaClipProps: (clipId: string, patch: Partial<Pick<MediaClip, 'volume' | 'muted'>>) => void
+  updateMediaClipProps: (clipId: string, patch: Partial<Pick<MediaClip, 'volume' | 'muted' | 'changeAudioPitch'>>) => void
 
   selectClip: (clipId: string | null) => void
   /** Sets (or clears, with null) the asset previewed standalone in the Preview panel. */
