@@ -36,14 +36,18 @@ inspired by CapCut's UX, using its own `.fcproj` JSON project format. The guidin
   `SUPPORTED_EXTENSIONS`; helpers `createEmptyProject`, `formatMMSS`, `fontCatalogEntry`,
   `aspectPresetFor`, `fileExtension`.
 - `src/renderer/state/projectStore.ts` — the document + transient UI state (selection, playhead,
-  isPlaying, pxPerSecond, previewAssetId) and all mutation actions.
+  isPlaying, pxPerSecond, previewAssetId, missingAssetIds) and all mutation actions.
 - `src/renderer/state/layoutStore.ts` — persisted view prefs: panel sizes, `trackHeight`
   (short/default/tall via `TRACK_HEIGHTS`), `useProxies`.
 - `src/renderer/state/toastStore.ts` — non-modal notification stack (`Toasts.tsx`).
 - `src/renderer/components/` — `Timeline.tsx`, `Preview.tsx`, `Inspector.tsx`, `MediaBin.tsx`,
-  `Toolbar.tsx`, `Home.tsx`, `EffectPreview.tsx`, `CaptionsPanel.tsx`, `BackgroundRemovalButton.tsx`.
-- `electron/main/` — `export.ts`, `proxy.ts`, `probe.ts`, `thumbnails.ts`, `waveform.ts`,
-  `transcribe.ts` (captions), `background.ts` (bg removal), `mediaProtocol.ts`.
+  `Toolbar.tsx`, `Home.tsx`, `EffectPreview.tsx`, `CaptionsPanel.tsx`, `BackgroundRemovalButton.tsx`,
+  `SpeedPanel.tsx`, `StorageSection.tsx`.
+- `electron/main/` — `export.ts`, `cache.ts` (content-keyed derived-media cache), `proxy.ts`,
+  `probe.ts`, `thumbnails.ts`, `waveform.ts`, `relink.ts` (missing-media), `transcribe.ts`
+  (captions), `background.ts` (bg removal), `mediaProtocol.ts`.
+- `src/renderer/projectIO.ts` — the single open/save path (lock, `.bak` recovery, offline check,
+  re-enrich, relink). `src/renderer/media.ts` — import + background enrichment.
 
 ## Current feature state (all implemented & verified)
 
@@ -83,6 +87,14 @@ Recently added (this track of work — all on `main`, pushed to github.com/Kngq/
     and proxy status.
 13. **Proxy option** — a "Use preview proxies" toggle (Inspector project view, `layoutStore`)
     gates proxy generation on import.
+14. **Speed tab redesign** — `SpeedPanel.tsx`: Standard/Curve/Velocity sub-tabs, tick-mark speed
+    slider + stepper, duration slider, "Change audio pitch" toggle (stored as
+    `MediaClip.changeAudioPitch`; export doesn't honor it yet), locked "Smooth slow-mo" row.
+15. **Instant import** — assets appear after the probe; heavy work runs in the background.
+16. **Media management (CapCut-derived)** — persistent content-keyed cache, remux-before-
+    transcode, 720p proxies, seek-based filmstrips, missing-media relink, atomic save + `.bak` +
+    lock, per-clip `sourceOverride`, working background removal. See "Media management
+    (implemented)".
 
 ## Research: how CapCut manages media (reverse-engineered, 2026-11-03)
 
@@ -165,29 +177,126 @@ triggers cascade cleanup when an asset is removed. `mediasearch.db` (`ev_41e8666
 virtual table plus `media_uuid_map` and `media_video_frames` for searching media by content.
 This feeds AI features (smart search, auto-cut). It is out of scope for freecut v1.
 
-### Takeaways for freecut
-- freecut already follows the same core idea: reference by absolute path (`MediaAsset.path`) and
-  keep a separate preview-only file (`previewPath`, the equivalent of CapCut's agency proxy).
-- Worth adopting, in order of value:
-  1. **Content-keyed persistent cache** for probe/thumbnail/waveform/proxy, keyed on
-     `hash(path + size + mtime)` with the header stored for validation. Today these go to
-     `os.tmpdir()/freecut-*` (see `proxy.ts` for why not `userData`), which the OS can wipe.
-     A dedicated app cache dir outside `userData` would keep the fetch workaround.
-  2. **Missing-media relink**: on project load, stat each asset path, mark missing ones, and
-     offer "locate file". Optionally auto-relink siblings in the same new folder.
-  3. **Bin vs timeline separation**: keep `assets` (bin) distinct from per-clip derived paths,
-     so a baked result (e.g. background-removal ProRes) replaces only the clip's source, as
-     CapCut swaps `materials.videos[].path`. This is the missing wiring for bg removal.
-  4. **Atomic project save** (write tmp → rename, keep `.bak`) and a lock file.
-  5. **Remux before transcode** for container-only problems (`ffmpeg -c copy`), plus age-based
-     cache cleanup that skips files referenced by recent projects.
-- Not verified: the exact hash input for cache keys (md5 of the path alone doesn't match
-  the observed keys) and relink matching heuristics. Both would need decompiling `libVECreator`
-  once Hopper/Ghidra can load it.
+### Takeaways for freecut: status
+All five recommendations below are now **implemented and verified** (2026-11-03). See "Media
+management (implemented)" below for how each works and what was tested.
+1. ~~Content-keyed persistent cache~~ ✅ `electron/main/cache.ts`.
+2. ~~Missing-media relink~~ ✅ `electron/main/relink.ts` + `src/renderer/projectIO.ts`.
+3. ~~Bin vs timeline separation~~ ✅ `MediaClip.sourceOverride` (bg removal now applies to a clip).
+4. ~~Atomic project save + lock~~ ✅ `project:write` / `readProjectFile` in `electron/main/index.ts`.
+5. ~~Remux before transcode + age-based cleanup~~ ✅ `proxy.ts` `planProxy`, `cleanCache`.
+
+Corrections to the research above, found while implementing:
+- **"Caches can't live in `userData`" is obsolete.** That came from `proxy.ts`, back when the
+  `freecut-media://` handler used `net.fetch`, which couldn't read `userData`. `mediaProtocol.ts`
+  was later rewritten to read with Node `fs`, which reads `userData` fine. The cache now lives at
+  `<userData>/Cache/<kind>/`, which survives OS temp cleanup.
+- **Filmstrip generation was the hidden import cost, not just the proxy.** The old sprite used
+  ffmpeg's `thumbnail` filter, which decodes every frame. CapCut's per-timestamp frame cache
+  suggests seeking instead, and switching to input-side `-ss` seeks made a 120 s 1080p sprite take
+  about 0.9 s.
+- The exact CapCut cache-key hash input is still unknown and doesn't matter for freecut: we use
+  `sha1(kind:version:path:size:mtimeMs)`.
+
+## Media management (implemented)
+
+### Cache (`electron/main/cache.ts`)
+- Location: `<userData>/Cache/{mediainfo,thumbnails,waveforms,proxies,remux,mattes}/`. One global
+  cache shared by all projects. Deleting the folder never loses work; everything regenerates.
+- Key: `sha1(kind : KIND_VERSION[kind] : path : size : mtimeMs)`. Editing or replacing a source
+  invalidates its entries. Bump `KIND_VERSION` when an artifact's format or params change.
+- Each entry has a `<key>.meta.json` sidecar (source path/size/mtime) used by cleanup.
+- Writes are atomic (tmp + rename). Concurrent builds of one key are deduped (`dedupe`).
+- Cleanup `cleanCache(maxAgeDays, protectedSources)`: entries unused for N days are removed,
+  except those built from protected media or referenced directly (a clip's `sourceOverride`).
+  "Draft protection" = asset paths + override paths read from the open project and the
+  recents list (`protectedSourcesFor`). Runs once at launch with 30 days, like CapCut's
+  `cacheDate=30`. Inspector → Project → Storage shows usage per kind, "Clear cache" (protected),
+  and "Show in Finder".
+- Producers on the cache: `probe.ts` (probe results; warm = ~0 ms), `thumbnails.ts`,
+  `waveform.ts`, `proxy.ts`, `background.ts`.
+
+### Proxies (`electron/main/proxy.ts`)
+`planProxy(ext, vcodec, acodec)` picks the cheapest fix:
+- `none`: browser-playable codecs in a browser-friendly container (also always for stills).
+- `remux`: codecs fine, container not (e.g. `.mkv`/`.avi` with h264). Lossless `-c copy` +
+  `faststart` takes milliseconds. A failed remux falls back to a transcode.
+- `transcode`: undecodable codec (ProRes, DNxHD, AC-3, …), so a **720p** H.264 proxy (CapCut's
+  default proxy resolution), much faster than full res.
+The "Use preview proxies" toggle gates this, and turning it off now also clears existing proxies on
+re-enrich. Export always reads the original.
+
+### Fast import + background enrichment (`src/renderer/media.ts`)
+`importAssets` returns after the probe only (~40–170 ms per file), so assets appear immediately.
+`enrichAsset` then fills in proxy, filmstrip and waveform in the background via `patchAsset`
+(no dirty flag, no undo entry). `refreshAsset` re-probes and re-enriches an existing asset. It
+runs on project open and after relink, and also repairs old projects whose stored artifact paths
+pointed into the previous temp-dir caches.
+
+### Missing media + relink (`electron/main/relink.ts`, `src/renderer/projectIO.ts`)
+- Every open path (Home, Open…, Recents) goes through `projectIO.loadOpenedProject`, which stats
+  all asset paths (`media:findMissing`), sets `missingAssetIds`, and toasts a count.
+- Offline UI: a red "Media offline / Locate…" overlay on bin cards, a striped red clip with an
+  "Offline" tag on the timeline, and a "Media offline" frame in the preview (the element is skipped,
+  so there's no misleading codec error).
+- `locateMissing(assetId)`: the user picks one file. Its folder (and one level of subfolders) is
+  then searched for the other missing files by basename, and a match is applied only when unique.
+  `relinkAssets(oldPath→newPath)` rewrites asset paths and drops stale artifacts; clips keep their
+  asset ids, so the timeline is untouched. Undoable.
+- Preview element pools are keyed by clip id and now re-point `src` when the playable path changes
+  (relink, a proxy arriving later). Previously a pooled `<video>` kept playing the stale file.
+
+### Project file safety (`electron/main/index.ts`)
+- Save: write `<file>.tmp` → copy the previous file to `<file>.bak` → rename. All saves go through
+  `projectIO.saveProject`.
+- Open: if the file is unreadable, fall back to `.bak` and tell the user.
+- Advisory lock `<file>.lock` holds the PID. A lock held by a different *live* process triggers a
+  warning toast. A dead-PID lock (from a crash) is silently taken over. It's removed on quit.
+
+### Bin vs timeline: `MediaClip.sourceOverride` (`src/shared/types.ts`)
+A clip can render from a baked stand-in instead of its asset, the way CapCut swaps a timeline
+material's `path` while the bin keeps the original. `{ path, previewPath?, kind, hasAlpha }`.
+- Export: `resolveSourceOverridesWithAudio` maps overridden clips to synthetic assets so per-asset
+  ffmpeg input dedup still works. **Audio stays on the original file**, because bakes change
+  pixels and may have no audio stream. A real export caught this; it's now a regression test.
+- Preview plays `previewPath` (VP9+alpha WebM), since Chromium can't decode ProRes 4444.
+- Cleanup protects override files directly.
+
+### Background removal (`electron/main/background.ts`): now working end to end
+- Model: `u2netp.onnx` (4.6 MB) from rembg's own GitHub release, replacing a 176 MB third-party
+  mirror. Runtime: optional `onnxruntime-node` (v1.31 has prebuilt darwin-arm64 binaries and needs
+  no compile; it must be installed in the app's own `node_modules`).
+- Fixed while wiring: the matte was never scaled to the frame (now `scale2ref`), reassembly was
+  hardcoded to 30 fps (now the source fps, NTSC-exact), stream-copied audio could fail in MOV (now
+  PCM), and temp frames leaked (now removed in `finally`). Output is cached by source.
+- The Inspector button applies the result as the clip's `sourceOverride`. "Restore original
+  background" clears it.
+
+### Verified (2026-11-03)
+- Unit: 77 tests (`vitest.config.ts` now also runs `electron/**/*.test.ts`). New: `planProxy`,
+  `resolveSourceOverrides`, override export inputs/audio, `relinkAssets`, `patchAsset`,
+  `setClipSourceOverride`. The override tests fail with the fix reverted.
+- Real ffmpeg (main modules run under tsx): probe cold 33–770 ms, warm 0–1 ms; sprite 0.15–0.95 s;
+  mkv remux 12 ms; ProRes → 720p proxy 317 ms; protected cleanup kept only protected entries.
+- Real export: an alpha ProRes override on Video 2 composites over Video 1. Pixel samples are red
+  where the overlay is transparent and green where opaque, and both tracks' audio is present.
+- Real bake: 48 frames @ 24 fps in ~5 s. Alpha is 0xff on the subject and 0x00 on the background,
+  fps and duration are preserved, the WebM keeps alpha, and a cached re-bake takes 11 ms.
+- In the app (CDP driver): import → remux + filmstrips → save twice (`.bak` created) → move the
+  media folder → reopen (3 offline, UI flagged) → relink (0 missing, clips intact, artifacts
+  regenerated) → corrupt file → reopen recovered from `.bak`.
+
+See also `frontend.md` (CapCut UI teardown from the same research session, not yet acted on).
 
 ## Build / verify commands
 - `npx tsc -p tsconfig.json --noEmit` — typecheck (passes clean).
-- `npx vitest run` / `npm test` — unit tests (63 passing: shared types, ffmpegGraph, effects, store).
+- `npx vitest run` / `npm test` — unit tests (77 passing: shared types, ffmpegGraph, effects,
+  media management, store, and main-process `proxy.test.ts`).
+- Check `tsc` with its real exit code (`npx tsc ... ; echo $?`). Piping it into `head` hides
+  failures.
+- Main-process modules can be exercised against real ffmpeg without Electron by running them
+  under `tsx` with a tsconfig `paths` entry that maps `electron` to a tiny stub exporting
+  `app.getPath`. That's how the cache/proxy/sprite/bake numbers above were measured.
 - `npx vite build` — builds renderer + main + preload bundles (all pass).
 - Agent-driven UI verification: the CDP driver at `scripts/devDriver.mjs` (see
   `.claude/skills/run-freecut/SKILL.md`) — `launch`, `eval`, `screenshot`, `quit`. Screenshots in
@@ -196,9 +305,14 @@ This feeds AI features (smart search, auto-cut). It is out of scope for freecut 
 ## Known limitations / good next steps
 - **Captions** require `brew install whisper-cpp` (binary not bundled); once installed, the model
   downloads on first use. Consider bundling `@remotion/install-whisper-cpp` to auto-fetch the binary.
-- **Background removal** requires `npm i onnxruntime-node` (optional, prebuilt arm64). The pipeline
-  is per-frame (temporal flicker possible) and outputs a ProRes 4444 `.mov` path — the
-  import-as-overlay wiring (swap the clip to the matted result) is still a TODO.
+- **Background removal** requires `npm i onnxruntime-node` (optional, prebuilt arm64) and is
+  CPU-only. It's per-frame (edges can flicker; temporal smoothing is the next refinement). The
+  button shows bake progress. The result applies to the clip; put it on an upper track to
+  composite.
+- **Relink** auto-matches by unique basename only. Files renamed as well as moved need to be
+  located one by one. There's no "relink by content hash" yet.
+- **Project lock** is advisory (a warning, never a block), by design.
+- **`changeAudioPitch`** is stored but export still uses pitch-preserving `atempo`.
 - **Overlay video tracks** are contiguous per-track rolls (clips butt from 0); free positioning of
   an overlay clip at an arbitrary start isn't exposed yet (export already honors `clip.start`).
 - **fontfile** paths in export are macOS system-font paths; a cross-platform font resolver (or
