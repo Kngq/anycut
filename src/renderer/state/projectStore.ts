@@ -47,6 +47,9 @@ interface ProjectState {
   redo: () => void
 
   addAsset: (asset: MediaAsset) => void
+  /** Merges partial fields into an existing asset (used to attach proxy/cover/waveform as the
+   *  background jobs for them finish, so an imported asset can appear instantly and fill in). */
+  patchAsset: (assetId: string, patch: Partial<MediaAsset>) => void
   /** Removes an asset from the media pool and any clips on the timeline that reference it. */
   removeAsset: (assetId: string) => void
   /** On video tracks the clip is appended unless `insertAtStart` is set, in which case it's placed at `start`. */
@@ -289,6 +292,16 @@ export const useProjectStore = create<ProjectState>((set) => ({
 
   addAsset: (asset) =>
     set((s) => ({ project: touch({ ...s.project, assets: [...s.project.assets, asset] }), dirty: true })),
+
+  patchAsset: (assetId, patch) =>
+    set((s) => {
+      // No-op if the asset is gone (e.g. removed before a background job finished). Don't mark
+      // dirty or record undo — attaching a derived artifact (proxy/cover/waveform) isn't a
+      // document edit the user needs to undo/save-prompt over.
+      if (!s.project.assets.some((a) => a.id === assetId)) return {}
+      const assets = s.project.assets.map((a) => (a.id === assetId ? { ...a, ...patch } : a))
+      return { project: { ...s.project, assets } }
+    }),
 
   removeAsset: (assetId) =>
     set((s) => {

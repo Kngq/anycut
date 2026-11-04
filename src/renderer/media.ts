@@ -1,6 +1,7 @@
 import type { MediaAsset } from '@shared/types'
 import { ALL_SUPPORTED_EXTENSIONS, SUPPORTED_EXTENSIONS, fileExtension } from '@shared/types'
 import { useLayoutStore } from './state/layoutStore'
+import { useProjectStore } from './state/projectStore'
 
 /** MIME type used when dragging an already-imported asset from the media bin. */
 export const ASSET_DRAG_MIME = 'application/x-freecut-asset'
@@ -26,7 +27,16 @@ export interface ImportResult {
   rejected: { name: string; reason: string }[]
 }
 
-/** Probes each path and returns the assets that could be read, plus explained rejections. */
+/**
+ * Imports media FAST: only the cheap `probeMedia` (an ffprobe metadata read) runs synchronously,
+ * so an asset is returned — and can appear in the bin — the moment the Finder dialog closes.
+ *
+ * The expensive, full-file ffmpeg work (preview proxy transcode, thumbnail sprite, audio
+ * waveform) is kicked off in the BACKGROUND by `enrichAsset` and patched onto the asset in the
+ * store as each job finishes. This used to all run up-front, blocking the import for seconds per
+ * clip. Export never depended on any of it, and the preview/timeline read these fields per-render
+ * so they light up as they arrive.
+ */
 export async function importAssets(paths: string[]): Promise<ImportResult> {
   const assets: MediaAsset[] = []
   const rejected: { name: string; reason: string }[] = []
@@ -51,32 +61,14 @@ export async function importAssets(paths: string[]): Promise<ImportResult> {
       })
       continue
     }
-    // Some codecs (ProRes, DNxHD, ...) demux fine in Chromium but never actually decode a
-    // frame — no error, just a permanently blank/silent clip. ensurePreviewProxy returns null
-    // immediately for anything already browser-playable, so this is a no-op for the common case.
-    // Honors the user's "use proxies" preference (Inspector → Project): off = preview the
-    // original directly (faster import; incompatible codecs may show blank — export is unaffected).
-    const useProxies = useLayoutStore.getState().useProxies
-    const previewPath =
-      probe.kind === 'image' || !useProxies
-        ? undefined
-        : (await window.api.ensurePreviewProxy(path, probe.videoCodec, probe.audioCodec)) ?? undefined
 
-    // Cover image for the timeline clip (first frame for video; the image file itself for images)
-    // and an audio waveform (anything with an audio stream). Both are produced locally with the
-    // bundled ffmpeg and cached on disk — fully offline, no network. Generated off the ORIGINAL
-    // source (not the preview proxy) so they're correct even when no proxy exists.
-    const [videoCover, waveform] = await Promise.all([
-      probe.kind === 'video' ? window.api.generateThumbnails(path) : Promise.resolve(null),
-      probe.hasAudio || probe.kind === 'audio' ? window.api.generateWaveform(path) : Promise.resolve(null)
-    ])
-    // Images are their own cover — one frame, the image itself (no extraction needed).
+    // Images are their own cover immediately (no extraction needed) — cheap, so do it inline.
     const cover =
       probe.kind === 'image'
         ? { path, frames: 1, frameWidth: probe.width ?? 160, frameHeight: probe.height ?? 90 }
-        : videoCover ?? undefined
+        : undefined
 
-    assets.push({
+    const asset: MediaAsset = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       path,
       kind: probe.kind,
@@ -85,12 +77,53 @@ export async function importAssets(paths: string[]): Promise<ImportResult> {
       width: probe.width,
       height: probe.height,
       hasAudio: probe.hasAudio,
-      previewPath,
-      cover,
-      waveform: waveform ?? undefined
-    })
+      cover
+    }
+    assets.push(asset)
+    // Fire-and-forget the heavy artifacts; they patch themselves onto the asset when ready.
+    void enrichAsset(asset, probe)
   }
   return { assets, rejected }
+}
+
+/**
+ * Background-generates an asset's preview proxy, filmstrip cover, and waveform (each a full-file
+ * ffmpeg pass), patching the store as each completes. Runs entirely after the asset is already
+ * visible, so import feels instant. All jobs are independent and cached on disk by the main
+ * process, so re-importing the same file is cheap.
+ */
+async function enrichAsset(asset: MediaAsset, probe: NonNullable<Awaited<ReturnType<typeof window.api.probeMedia>>>): Promise<void> {
+  const patch = useProjectStore.getState().patchAsset
+
+  // Preview proxy (only for codecs Chromium can't decode, and only if the user wants proxies).
+  if (probe.kind !== 'image' && useLayoutStore.getState().useProxies) {
+    window.api
+      .ensurePreviewProxy(asset.path, probe.videoCodec, probe.audioCodec)
+      .then((previewPath) => {
+        if (previewPath) patch(asset.id, { previewPath })
+      })
+      .catch(() => {})
+  }
+
+  // Filmstrip cover (video first-frame sprite).
+  if (probe.kind === 'video') {
+    window.api
+      .generateThumbnails(asset.path)
+      .then((videoCover) => {
+        if (videoCover) patch(asset.id, { cover: videoCover })
+      })
+      .catch(() => {})
+  }
+
+  // Audio waveform (anything with an audio stream).
+  if (probe.hasAudio || probe.kind === 'audio') {
+    window.api
+      .generateWaveform(asset.path)
+      .then((waveform) => {
+        if (waveform) patch(asset.id, { waveform })
+      })
+      .catch(() => {})
+  }
 }
 
 /** Back-compat convenience: import and surface any rejections via the toast channel, returning
