@@ -65,7 +65,7 @@ export async function importAssets(paths: string[]): Promise<ImportResult> {
     // Images are their own cover immediately (no extraction needed) — cheap, so do it inline.
     const cover =
       probe.kind === 'image'
-        ? { path, frames: 1, frameWidth: probe.width ?? 160, frameHeight: probe.height ?? 90 }
+        ? { path, frames: 1, frameWidth: probe.width ?? 1920, frameHeight: probe.height ?? 1080 }
         : undefined
 
     const asset: MediaAsset = {
@@ -87,6 +87,24 @@ export async function importAssets(paths: string[]): Promise<ImportResult> {
 }
 
 /**
+ * Re-derives an existing asset's proxy/filmstrip/waveform from its current `path`: after a relink,
+ * or when a project is opened (stored artifact paths may point into a cache that has since been
+ * cleaned). Probe and every artifact are disk-cached, so this is near-instant when nothing changed.
+ */
+export async function refreshAsset(asset: MediaAsset): Promise<void> {
+  const probe = await window.api.probeMedia(asset.path)
+  if (!probe) return
+  // Duration/size can change if the user relinked to a different encode of the "same" file.
+  useProjectStore.getState().patchAsset(asset.id, {
+    duration: asset.kind === 'image' ? asset.duration : probe.duration,
+    width: probe.width ?? asset.width,
+    height: probe.height ?? asset.height,
+    hasAudio: probe.hasAudio
+  })
+  await enrichAsset(asset, probe)
+}
+
+/**
  * Background-generates an asset's preview proxy, filmstrip cover, and waveform (each a full-file
  * ffmpeg pass), patching the store as each completes. Runs entirely after the asset is already
  * visible, so import feels instant. All jobs are independent and cached on disk by the main
@@ -95,20 +113,20 @@ export async function importAssets(paths: string[]): Promise<ImportResult> {
 async function enrichAsset(asset: MediaAsset, probe: NonNullable<Awaited<ReturnType<typeof window.api.probeMedia>>>): Promise<void> {
   const patch = useProjectStore.getState().patchAsset
 
-  // Preview proxy (only for codecs Chromium can't decode, and only if the user wants proxies).
+  // Preview proxy (only for codecs/containers Chromium can't play, and only if proxies are on).
   if (probe.kind !== 'image' && useLayoutStore.getState().useProxies) {
     window.api
       .ensurePreviewProxy(asset.path, probe.videoCodec, probe.audioCodec)
-      .then((previewPath) => {
-        if (previewPath) patch(asset.id, { previewPath })
-      })
+      .then((previewPath) => patch(asset.id, { previewPath: previewPath ?? undefined }))
       .catch(() => {})
+  } else if (asset.previewPath) {
+    patch(asset.id, { previewPath: undefined })
   }
 
   // Filmstrip cover (video first-frame sprite).
   if (probe.kind === 'video') {
     window.api
-      .generateThumbnails(asset.path)
+      .generateThumbnails(asset.path, probe.duration)
       .then((videoCover) => {
         if (videoCover) patch(asset.id, { cover: videoCover })
       })

@@ -10,6 +10,7 @@ import Toasts from './components/Toasts'
 import { useProjectStore } from './state/projectStore'
 import { useLayoutStore } from './state/layoutStore'
 import { useToastStore } from './state/toastStore'
+import { useRecentsStore } from './state/recentsStore'
 import { setImportErrorHandler } from './media'
 
 export default function App() {
@@ -34,6 +35,10 @@ export default function App() {
   // instead of a bare alert().
   useEffect(() => {
     setImportErrorHandler((message) => useToastStore.getState().push('error', message))
+    // Age-based cache cleanup once per launch (CapCut's cacheDate=30): drop derived media unused
+    // for 30 days, keeping anything referenced by recent projects.
+    const recents = useRecentsStore.getState().recents.map((r) => r.path)
+    void window.api.cleanCache(30, recents, [])
   }, [])
 
   useEffect(() => {

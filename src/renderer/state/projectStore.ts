@@ -29,6 +29,9 @@ interface ProjectState {
    *  card in the MediaBin), independent of the timeline. Null = show the timeline as normal.
    *  Session-only, never serialized. */
   previewAssetId: string | null
+  /** Transient: ids of assets whose source file is missing on disk (moved/renamed/unplugged).
+   *  Set by the post-open media check; cleared per asset when it's relinked. Never serialized. */
+  missingAssetIds: string[]
   playhead: number
   isPlaying: boolean
   pxPerSecond: number
@@ -52,6 +55,12 @@ interface ProjectState {
   patchAsset: (assetId: string, patch: Partial<MediaAsset>) => void
   /** Removes an asset from the media pool and any clips on the timeline that reference it. */
   removeAsset: (assetId: string) => void
+  /** Records which assets are offline (source file missing). */
+  setMissingAssets: (assetIds: string[]) => void
+  /** Points assets at new source paths (oldPath → newPath). Derived artifacts built from the old
+   *  file (proxy, filmstrip, waveform) are dropped so they're regenerated from the new one; clips
+   *  keep referencing the same asset id, so the timeline is untouched. Undoable. */
+  relinkAssets: (pathMap: Record<string, string>) => void
   /** On video tracks the clip is appended unless `insertAtStart` is set, in which case it's placed at `start`. */
   addMediaClipToTrack: (trackId: string, asset: MediaAsset, start: number, options?: { insertAtStart?: boolean }) => void
   addTextClipToTrack: (trackId: string, start: number) => void
@@ -99,6 +108,9 @@ interface ProjectState {
   updateClipEffectParam: (clipId: string, effectId: string, key: string, value: number) => void
   updateTextClip: (clipId: string, patch: Record<string, unknown>) => void
   updateMediaClipProps: (clipId: string, patch: Partial<Pick<MediaClip, 'volume' | 'muted' | 'changeAudioPitch'>>) => void
+  /** Points one clip at a baked stand-in (e.g. background removed), or clears it (undefined).
+   *  The bin asset is untouched. Undoable. */
+  setClipSourceOverride: (clipId: string, override: MediaClip['sourceOverride']) => void
 
   selectClip: (clipId: string | null) => void
   /** Sets (or clears, with null) the asset previewed standalone in the Preview panel. */
@@ -253,15 +265,16 @@ export const useProjectStore = create<ProjectState>((set) => ({
   dirty: false,
   selectedClipId: null,
   previewAssetId: null,
+  missingAssetIds: [],
   playhead: 0,
   isPlaying: false,
   pxPerSecond: 60,
   past: [],
   future: [],
 
-  setProject: (project, filePath = null) => set({ project, filePath, dirty: false, selectedClipId: null, previewAssetId: null, playhead: 0, past: [], future: [] }),
+  setProject: (project, filePath = null) => set({ project, filePath, dirty: false, selectedClipId: null, previewAssetId: null, missingAssetIds: [], playhead: 0, past: [], future: [] }),
 
-  newProject: () => set({ project: createEmptyProject('Untitled'), filePath: null, dirty: false, selectedClipId: null, previewAssetId: null, playhead: 0, past: [], future: [] }),
+  newProject: () => set({ project: createEmptyProject('Untitled'), filePath: null, dirty: false, selectedClipId: null, previewAssetId: null, missingAssetIds: [], playhead: 0, past: [], future: [] }),
 
   undo: () =>
     set((s) => {
@@ -318,6 +331,30 @@ export const useProjectStore = create<ProjectState>((set) => ({
         dirty: true,
         selectedClipId: selectionStillExists ? s.selectedClipId : null,
         previewAssetId: previewStillExists ? s.previewAssetId : null,
+        ...recordPast(s)
+      }
+    }),
+
+  setMissingAssets: (assetIds) => set({ missingAssetIds: assetIds }),
+
+  relinkAssets: (pathMap) =>
+    set((s) => {
+      const relinkedIds: string[] = []
+      const assets = s.project.assets.map((a) => {
+        const next = pathMap[a.path]
+        if (!next || next === a.path) return a
+        relinkedIds.push(a.id)
+        const name = next.split(/[/\\]/).pop() ?? a.name
+        // Drop artifacts derived from the OLD file; the caller re-enriches from the new path.
+        // Images are their own cover, so theirs just follows the new path.
+        const cover = a.kind === 'image' && a.cover ? { ...a.cover, path: next } : undefined
+        return { ...a, path: next, name, previewPath: undefined, cover, waveform: undefined }
+      })
+      if (relinkedIds.length === 0) return {}
+      return {
+        project: touch({ ...s.project, assets }),
+        missingAssetIds: s.missingAssetIds.filter((id) => !relinkedIds.includes(id)),
+        dirty: true,
         ...recordPast(s)
       }
     }),
@@ -804,6 +841,17 @@ export const useProjectStore = create<ProjectState>((set) => ({
         clips: t.clips.map((c) => (c.id === clipId ? ({ ...c, ...patch } as Clip) : c))
       }))
       return { project, dirty: true }
+    }),
+
+  setClipSourceOverride: (clipId, override) =>
+    set((s) => {
+      const found = findClip(s.project, clipId)
+      if (!found || found.clip.kind !== 'media') return {}
+      const project = updateTrack(s.project, found.track.id, (t) => ({
+        ...t,
+        clips: t.clips.map((c) => (c.id === clipId && c.kind === 'media' ? { ...c, sourceOverride: override } : c))
+      }))
+      return { project, dirty: true, ...recordPast(s) }
     }),
 
   selectClip: (clipId) => set((s) => ({ selectedClipId: clipId, previewAssetId: clipId ? null : s.previewAssetId })),

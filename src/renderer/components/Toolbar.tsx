@@ -1,19 +1,16 @@
 import { useEffect, useState } from 'react'
 import { useProjectStore } from '../state/projectStore'
-import { useRecentsStore } from '../state/recentsStore'
+import { loadOpenedProject, saveProject } from '../projectIO'
 import { ASPECT_PRESETS, aspectPresetFor } from '@shared/types'
 import type { ExportProgress } from '@shared/ipc'
 
 export default function Toolbar({ onGoHome }: { onGoHome: () => void }) {
   const project = useProjectStore((s) => s.project)
-  const filePath = useProjectStore((s) => s.filePath)
   const dirty = useProjectStore((s) => s.dirty)
   const addTextClipToTrack = useProjectStore((s) => s.addTextClipToTrack)
   const setCanvasSize = useProjectStore((s) => s.setCanvasSize)
   const playhead = useProjectStore((s) => s.playhead)
   const newProject = useProjectStore((s) => s.newProject)
-  const setProject = useProjectStore((s) => s.setProject)
-  const addRecent = useRecentsStore((s) => s.addRecent)
 
   const [exportState, setExportState] = useState<ExportProgress | null>(null)
   const [exporting, setExporting] = useState(false)
@@ -23,6 +20,7 @@ export default function Toolbar({ onGoHome }: { onGoHome: () => void }) {
   async function handleNew() {
     if (dirty && !confirm('Discard unsaved changes and start a new project?')) return
     newProject()
+    void window.api.lockProject(null)
   }
 
   function handleGoHome() {
@@ -33,27 +31,15 @@ export default function Toolbar({ onGoHome }: { onGoHome: () => void }) {
   async function handleOpen() {
     const result = await window.api.openProjectDialog()
     if (!result) return
-    setProject(result.project, result.path)
-    addRecent(result.path, result.project.name)
+    loadOpenedProject(result)
   }
 
   async function handleSave() {
-    let path = filePath
-    if (!path) {
-      path = await window.api.saveProjectDialog(project.name)
-      if (!path) return
-    }
-    await window.api.writeProject(path, project)
-    useProjectStore.setState({ filePath: path, dirty: false })
-    addRecent(path, project.name)
+    await saveProject(false)
   }
 
   async function handleSaveAs() {
-    const path = await window.api.saveProjectDialog(project.name)
-    if (!path) return
-    await window.api.writeProject(path, project)
-    useProjectStore.setState({ filePath: path, dirty: false })
-    addRecent(path, project.name)
+    await saveProject(true)
   }
 
   async function handleExport() {

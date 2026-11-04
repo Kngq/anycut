@@ -3,6 +3,7 @@ import { canMergeWithNext, useProjectStore } from '../state/projectStore'
 import { useLayoutStore } from '../state/layoutStore'
 import BackgroundRemovalButton from './BackgroundRemovalButton'
 import SpeedPanel from './SpeedPanel'
+import StorageSection from './StorageSection'
 import {
   EFFECT_CATALOG,
   FONT_CATALOG,
@@ -255,7 +256,7 @@ export default function Inspector() {
         <h3>Project</h3>
         <dl className="detail-list">
           <div className="detail-row"><dt>Name</dt><dd>{project.name}</dd></div>
-          <div className="detail-row"><dt>File path</dt><dd className="detail-path" title={filePath ?? 'Unsaved'}>{filePath ?? 'Unsaved'}</dd></div>
+          <div className="detail-row"><dt>File path</dt><dd className="detail-path" title={filePath ?? 'Unsaved'}>{filePath ? `\u200E${filePath}\u200E` : 'Unsaved'}</dd></div>
           <div className="detail-row"><dt>Aspect ratio</dt><dd>{aspectLabel}</dd></div>
           <div className="detail-row"><dt>Resolution</dt><dd>{width} × {height}</dd></div>
           <div className="detail-row"><dt>Frame rate</dt><dd>{fps} fps</dd></div>
@@ -275,6 +276,7 @@ export default function Inspector() {
             Export always uses the original. Applies to newly imported media.
           </div>
         </div>
+        <StorageSection />
         <div className="empty-hint" style={{ marginTop: 12 }}>Select a clip to edit its properties.</div>
       </div>
     )
@@ -378,7 +380,7 @@ export default function Inspector() {
           {track.type === 'video' &&
             (() => {
               const asset = project.assets.find((a) => a.id === clip.assetId)
-              return asset ? <BackgroundRemovalButton assetPath={asset.path} /> : null
+              return asset ? <BackgroundRemovalButton clip={clip} assetPath={asset.path} /> : null
             })()}
         </>
       )}

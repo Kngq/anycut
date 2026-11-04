@@ -1427,3 +1427,85 @@ canvas.preview-canvas {
   color: var(--text-dim);
   flex-basis: 100%;
 }
+
+/* ── Offline (missing) media ──────────────────────────────────────────────────── */
+.asset-card.offline .asset-thumb {
+  border-color: #b4474a;
+}
+
+.asset-offline {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: rgba(42, 20, 22, 0.88);
+  color: #f0b3b3;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.asset-locate {
+  padding: 2px 8px;
+  border: 1px solid #b4474a;
+  border-radius: 4px;
+  background: transparent;
+  color: #fff;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.asset-locate:hover {
+  background: #b4474a;
+}
+
+.clip.offline {
+  border-color: #b4474a !important;
+  background: repeating-linear-gradient(45deg, #3a1d20, #3a1d20 8px, #2a1416 8px, #2a1416 16px);
+}
+
+.clip.offline .clip-filmstrip,
+.clip.offline .clip-waveform {
+  opacity: 0.25;
+}
+
+.clip-offline-tag {
+  padding: 0 5px;
+  border-radius: 3px;
+  background: #b4474a;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+/* ── Storage (cache) section in the Inspector's project view ─────────────────── */
+.storage-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.storage-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.storage-row strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.storage-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.storage-actions button {
+  flex: 1;
+}

@@ -90,3 +90,55 @@ describe('projectStore — undo / redo', () => {
     expect(useProjectStore.getState().project.tracks.flatMap((t) => t.clips).length).toBe(countBefore)
   })
 })
+
+describe('projectStore — media management', () => {
+  beforeEach(() => {
+    useProjectStore.getState().newProject()
+  })
+
+  it('relinkAssets repoints the asset, drops derived artifacts, clears offline, keeps clips', () => {
+    const id = seedOneClip()
+    useProjectStore.getState().patchAsset('a', { previewPath: '/cache/p.mp4', waveform: { peaks: [0.5] } })
+    useProjectStore.getState().setMissingAssets(['a'])
+    useProjectStore.getState().relinkAssets({ '/tmp/a.mp4': '/new/place/a.mp4' })
+    const st = useProjectStore.getState()
+    const asset = st.project.assets.find((x) => x.id === 'a')!
+    expect(asset.path).toBe('/new/place/a.mp4')
+    expect(asset.previewPath).toBeUndefined()
+    expect(asset.waveform).toBeUndefined()
+    expect(st.missingAssetIds).toEqual([])
+    // The timeline clip still references the same asset id.
+    const clip = st.project.tracks.flatMap((t) => t.clips).find((c) => c.id === id)!
+    expect(clip.kind === 'media' && clip.assetId).toBe('a')
+  })
+
+  it('relinkAssets is undoable', () => {
+    seedOneClip()
+    useProjectStore.getState().relinkAssets({ '/tmp/a.mp4': '/new/a.mp4' })
+    useProjectStore.getState().undo()
+    expect(useProjectStore.getState().project.assets[0].path).toBe('/tmp/a.mp4')
+  })
+
+  it('patchAsset attaches artifacts without dirtying or adding undo history', () => {
+    seedOneClip()
+    useProjectStore.setState({ dirty: false })
+    const pastLen = useProjectStore.getState().past.length
+    useProjectStore.getState().patchAsset('a', { previewPath: '/cache/p.mp4' })
+    expect(useProjectStore.getState().project.assets[0].previewPath).toBe('/cache/p.mp4')
+    expect(useProjectStore.getState().dirty).toBe(false)
+    expect(useProjectStore.getState().past.length).toBe(pastLen)
+  })
+
+  it('setClipSourceOverride applies to one clip only and is undoable', () => {
+    const id = seedOneClip()
+    useProjectStore.getState().setClipSourceOverride(id, { path: '/cache/m.mov', kind: 'backgroundRemoved', hasAlpha: true })
+    const override = () => {
+      const c = useProjectStore.getState().project.tracks.flatMap((t) => t.clips).find((x) => x.id === id)!
+      return c.kind === 'media' ? c.sourceOverride : 'not-media'
+    }
+    expect(override()).toMatchObject({ path: '/cache/m.mov' })
+    expect(useProjectStore.getState().project.assets[0].path).toBe('/tmp/a.mp4')
+    useProjectStore.getState().undo()
+    expect(override()).toBeUndefined()
+  })
+})

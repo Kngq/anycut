@@ -262,6 +262,7 @@ export default function Timeline() {
   const pxPerSecond = useProjectStore((s) => s.pxPerSecond)
   const playhead = useProjectStore((s) => s.playhead)
   const selectedClipId = useProjectStore((s) => s.selectedClipId)
+  const missingAssetIds = useProjectStore((s) => s.missingAssetIds)
   const setPlayhead = useProjectStore((s) => s.setPlayhead)
   const selectClip = useProjectStore((s) => s.selectClip)
   const trimClip = useProjectStore((s) => s.trimClip)
@@ -511,6 +512,7 @@ export default function Timeline() {
     const width = Math.max(clip.duration * pxPerSecond, 4)
 
     const asset = clip.kind === 'media' ? project.assets.find((a) => a.id === clip.assetId) : undefined
+    const offline = clip.kind === 'media' && missingAssetIds.includes(clip.assetId)
     const name = clip.kind === 'text' ? clip.text : asset?.name ?? track.name
     const headerLabel = clip.kind === 'text' ? clip.text : `${name}  ${formatTimecode(clip.duration)}`
 
@@ -542,7 +544,7 @@ export default function Timeline() {
     return (
       <div
         key={clip.id}
-        className={`clip ${clipClassName(clip, track)} ${hasCover ? 'has-cover' : ''} ${selectedClipId === clip.id ? 'selected' : ''}`}
+        className={`clip ${clipClassName(clip, track)} ${hasCover ? 'has-cover' : ''} ${selectedClipId === clip.id ? 'selected' : ''} ${offline ? 'offline' : ''}`}
         style={{ left, width, zIndex: isDraggingThis ? 10 : 1 }}
         onMouseDown={(e) => onClipPointerDown(e, clip, track)}
         title={clip.kind === 'text' ? clip.text : `${name} · ${clip.duration.toFixed(1)}s`}
@@ -560,6 +562,7 @@ export default function Timeline() {
         )}
         <div className="clip-header">
           {clip.transitionIn && track.type === 'video' && <span className="clip-transition-badge">⤬</span>}
+          {offline && <span className="clip-offline-tag">Offline</span>}
           <span className="clip-title">{headerLabel}</span>
         </div>
         {hasWaveform && anyVisible && (

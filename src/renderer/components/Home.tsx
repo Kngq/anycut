@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useProjectStore } from '../state/projectStore'
 import { useRecentsStore } from '../state/recentsStore'
+import { loadOpenedProject } from '../projectIO'
 
 function formatRelativeTime(ts: number): string {
   const minutes = Math.round((Date.now() - ts) / 60000)
@@ -15,22 +16,20 @@ function formatRelativeTime(ts: number): string {
 
 export default function Home({ onEnterEditor }: { onEnterEditor: () => void }) {
   const newProject = useProjectStore((s) => s.newProject)
-  const setProject = useProjectStore((s) => s.setProject)
   const recents = useRecentsStore((s) => s.recents)
-  const addRecent = useRecentsStore((s) => s.addRecent)
   const removeRecent = useRecentsStore((s) => s.removeRecent)
   const [missing, setMissing] = useState<Set<string>>(new Set())
 
   function handleCreate() {
     newProject()
+    void window.api.lockProject(null)
     onEnterEditor()
   }
 
   async function handleOpenDialog() {
     const result = await window.api.openProjectDialog()
     if (!result) return
-    setProject(result.project, result.path)
-    addRecent(result.path, result.project.name)
+    loadOpenedProject(result)
     onEnterEditor()
   }
 
@@ -40,8 +39,7 @@ export default function Home({ onEnterEditor }: { onEnterEditor: () => void }) {
       setMissing((s) => new Set(s).add(path))
       return
     }
-    setProject(result.project, result.path)
-    addRecent(result.path, result.project.name)
+    loadOpenedProject(result)
     onEnterEditor()
   }
 

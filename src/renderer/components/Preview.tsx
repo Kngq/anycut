@@ -107,6 +107,30 @@ function drawMediaError(ctx: CanvasRenderingContext2D, canvasW: number, canvasH:
   ctx.restore()
 }
 
+/** A "media offline" placeholder (source file moved/renamed/unplugged) drawn where the clip would be. */
+function drawOffline(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, assetName: string) {
+  const lh = Math.max(canvasH * 0.026, 16)
+  ctx.save()
+  ctx.fillStyle = '#2a1416'
+  ctx.fillRect(0, 0, canvasW, canvasH)
+  ctx.strokeStyle = 'rgba(220, 80, 80, 0.5)'
+  ctx.lineWidth = Math.max(2, canvasW * 0.004)
+  ctx.beginPath()
+  ctx.moveTo(0, 0)
+  ctx.lineTo(canvasW, canvasH)
+  ctx.moveTo(canvasW, 0)
+  ctx.lineTo(0, canvasH)
+  ctx.stroke()
+  ctx.fillStyle = 'white'
+  ctx.font = `bold ${lh * 1.2}px sans-serif`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText('Media offline', canvasW / 2, canvasH / 2 - lh * 0.8, canvasW - 32)
+  ctx.font = `${lh * 0.8}px sans-serif`
+  ctx.fillText(assetName, canvasW / 2, canvasH / 2 + lh * 0.8, canvasW - 32)
+  ctx.restore()
+}
+
 /** HTMLMediaElement.error.code -> a human-readable reason, since MediaError.message is often
  *  empty in practice (Chromium doesn't always fill it in). */
 function mediaErrorReason(code: number): string {
@@ -163,11 +187,21 @@ export default function Preview() {
     console.error(`[freecut preview] "${assetName}": ${message}`)
   }
 
+  /** The URL a pooled element should play for `asset` right now: the preview proxy if one has been
+   *  generated (it can arrive after import, or be cleared by turning proxies off), else the original.
+   *  Pools are keyed by clip id, so an element must be re-pointed when this changes (relink, a proxy
+   *  finishing in the background), or it keeps playing the stale file. */
+  function playableUrl(asset: MediaAsset, clip?: MediaClip): string {
+    // A clip's baked stand-in (e.g. background removed) wins over the asset's own file/proxy.
+    if (clip?.sourceOverride) return window.api.fileUrl(clip.sourceOverride.previewPath ?? clip.sourceOverride.path)
+    return window.api.fileUrl(asset.previewPath ?? asset.path)
+  }
+
   function getVideoEl(clip: MediaClip, asset: MediaAsset): HTMLVideoElement {
     let el = videoPoolRef.current.get(clip.id)
     if (!el) {
       el = document.createElement('video')
-      el.src = window.api.fileUrl(asset.previewPath ?? asset.path)
+      el.src = playableUrl(asset, clip)
       el.preload = 'auto'
       el.muted = true
       el.addEventListener('error', () => {
@@ -176,16 +210,25 @@ export default function Preview() {
       })
       el.addEventListener('loadeddata', () => errorsRef.current.delete(clip.id))
       videoPoolRef.current.set(clip.id, el)
+    } else if (el.src !== playableUrl(asset, clip)) {
+      const t = el.currentTime
+      el.src = playableUrl(asset, clip)
+      el.currentTime = t
+      errorsRef.current.delete(clip.id)
+      zeroSizeStartRef.current.delete(clip.id)
     }
     return el
   }
 
   function getImageEl(asset: MediaAsset): HTMLImageElement {
     let el = imagePoolRef.current.get(asset.id)
+    const url = window.api.fileUrl(asset.path)
     if (!el) {
       el = new Image()
-      el.src = window.api.fileUrl(asset.path)
+      el.src = url
       imagePoolRef.current.set(asset.id, el)
+    } else if (el.src !== url) {
+      el.src = url
     }
     return el
   }
@@ -194,7 +237,7 @@ export default function Preview() {
     let el = audioPoolRef.current.get(clip.id)
     if (!el) {
       el = document.createElement('audio')
-      el.src = window.api.fileUrl(asset.previewPath ?? asset.path)
+      el.src = playableUrl(asset, clip)
       el.preload = 'auto'
       el.addEventListener('error', () => {
         const reason = el!.error ? mediaErrorReason(el!.error.code) : 'failed to load'
@@ -202,6 +245,11 @@ export default function Preview() {
       })
       el.addEventListener('loadeddata', () => errorsRef.current.delete(clip.id))
       audioPoolRef.current.set(clip.id, el)
+    } else if (el.src !== playableUrl(asset, clip)) {
+      const t = el.currentTime
+      el.src = playableUrl(asset, clip)
+      el.currentTime = t
+      errorsRef.current.delete(clip.id)
     }
     return el
   }
@@ -312,7 +360,9 @@ export default function Preview() {
       ctx.fillStyle = 'black'
       ctx.fillRect(0, 0, width, height)
       const asset = project.assets.find((a) => a.id === state.previewAssetId)
-      if (asset) {
+      if (asset && state.missingAssetIds.includes(asset.id)) {
+        drawOffline(ctx, width, height, asset.name)
+      } else if (asset) {
         const tf = { x: 0.5, y: 0.5, scale: 1, opacity: 1, rotation: 0, flipH: false }
         if (asset.kind === 'image') {
           const img = getImageEl(asset)
@@ -369,6 +419,10 @@ export default function Preview() {
       if (track.type !== 'video' || track.hidden) continue
       const active = findActiveMedia(track, assetById, t)
       for (const { clip, asset, alpha } of active) {
+        if (state.missingAssetIds.includes(asset.id)) {
+          drawOffline(ctx, width, height, asset.name)
+          continue
+        }
         const localT = t - clip.start
         const interp = interpolateTransform(clip.transform, localT)
         // interpolateTransform only drives x/y/scale/opacity; rotation/flipH are static, read
@@ -422,6 +476,7 @@ export default function Preview() {
         if (t < clip.start || t >= clip.start + clip.duration) continue
         const asset = assetById.get(clip.assetId)
         if (!asset) continue
+        if (state.missingAssetIds.includes(asset.id)) continue
         const audioEl = getAudioEl(clip, asset)
         liveAudioIds.add(clip.id)
         const desired = sourceTimeFor(clip, t - clip.start)

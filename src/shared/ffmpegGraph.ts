@@ -1,4 +1,4 @@
-import { clipSpeedSegments, fontCatalogEntry, type Clip, type ClipTransform, type MediaAsset, type MediaClip, type Project, type Track } from './types'
+import { clipSpeedSegments, fontCatalogEntry, resolveSourceOverridesWithAudio, type Clip, type ClipTransform, type MediaAsset, type MediaClip, type Project, type Track } from './types'
 import { effectNeedsSubgraph, effectToFfmpegFilters, mirrorSubgraph, transitionToXfade } from './effects'
 
 export interface FfmpegPlan {
@@ -84,7 +84,9 @@ function hasActiveKeyframes(transform: ClipTransform): boolean {
  *  - Text tracks rendered with `drawtext`, layered on top of all video.
  *  - Audio tracks and un-muted video clip audio are trimmed, delayed, and mixed with `amix`.
  */
-export function buildFfmpegPlan(project: Project): FfmpegPlan {
+export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
+  // Clips with a baked stand-in (e.g. background removed) render from that file instead.
+  const { project, audioAssetFor } = resolveSourceOverridesWithAudio(inputProject)
   const { width, height, fps } = project.canvas
   const assetById = new Map(project.assets.map((a) => [a.id, a]))
 
@@ -533,7 +535,8 @@ export function buildFfmpegPlan(project: Project): FfmpegPlan {
 
   function addAudioClip(clip: MediaClip, asset: MediaAsset) {
     if (!asset.hasAudio || clip.muted || clip.volume <= 0) return
-    const ref = inputFor(clip.assetId)
+    // An overridden clip (e.g. background removed) still plays the ORIGINAL file's audio.
+    const ref = inputFor(audioAssetFor.get(clip.assetId) ?? clip.assetId)
     const trimmed = nextLabel('atrim')
     const delayMs = Math.round(clip.start * 1000)
     const segments = clipSpeedSegments(clip)

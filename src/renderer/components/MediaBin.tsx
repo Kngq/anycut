@@ -14,6 +14,7 @@ import {
   type TransitionType
 } from '@shared/types'
 import { ASSET_DRAG_MIME, assetsFromPaths, droppedFilePaths } from '../media'
+import { locateMissing } from '../projectIO'
 
 function TabIcon({ children }: { children: ReactNode }) {
   return (
@@ -141,6 +142,7 @@ export default function MediaBin() {
   const addTextClipToTrack = useProjectStore((s) => s.addTextClipToTrack)
   const setPreviewAsset = useProjectStore((s) => s.setPreviewAsset)
   const previewAssetId = useProjectStore((s) => s.previewAssetId)
+  const missingAssetIds = useProjectStore((s) => s.missingAssetIds)
   const playhead = useProjectStore((s) => s.playhead)
   const selectedClipId = useProjectStore((s) => s.selectedClipId)
   const addClipEffect = useProjectStore((s) => s.addClipEffect)
@@ -240,9 +242,10 @@ export default function MediaBin() {
                   backgroundRepeat: 'no-repeat'
                 }
               : undefined
+            const offline = missingAssetIds.includes(asset.id)
             return (
               <div
-                className={`asset-card ${previewAssetId === asset.id ? 'previewing' : ''}`}
+                className={`asset-card ${previewAssetId === asset.id ? 'previewing' : ''} ${offline ? 'offline' : ''}`}
                 key={asset.id}
                 draggable
                 onDragStart={(e) => {
@@ -254,8 +257,22 @@ export default function MediaBin() {
                 title="Click to preview, drag onto the timeline, or double-click to add"
               >
                 <div className="asset-thumb" style={thumbStyle}>
-                  {!asset.cover && <span className="asset-thumb-fallback">{asset.kind}</span>}
-                  {asset.duration > 0 && <span className="asset-duration">{formatMMSS(asset.duration)}</span>}
+                  {!asset.cover && !offline && <span className="asset-thumb-fallback">{asset.kind}</span>}
+                  {offline && (
+                    <div className="asset-offline" title={`Missing: ${asset.path}`}>
+                      <span>Media offline</span>
+                      <button
+                        className="asset-locate"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          void locateMissing(asset.id)
+                        }}
+                      >
+                        Locate…
+                      </button>
+                    </div>
+                  )}
+                  {asset.duration > 0 && !offline && <span className="asset-duration">{formatMMSS(asset.duration)}</span>}
                   <button className="asset-item-remove" title="Remove from media pool" onClick={(e) => handleRemoveAsset(asset, e)}>
                     ×
                   </button>

@@ -27,7 +27,7 @@ const api: FreecutApi = {
   openMediaDialog: () => ipcRenderer.invoke('media:openDialog'),
   probeMedia: (path) => ipcRenderer.invoke('media:probe', path),
   ensurePreviewProxy: (path, videoCodec, audioCodec) => ipcRenderer.invoke('media:ensureProxy', path, videoCodec, audioCodec),
-  generateThumbnails: (path) => ipcRenderer.invoke('media:thumbnails', path),
+  generateThumbnails: (path, duration) => ipcRenderer.invoke('media:thumbnails', path, duration),
   generateWaveform: (path) => ipcRenderer.invoke('media:waveform', path),
   captionStatus: () => ipcRenderer.invoke('caption:status'),
   downloadCaptionModel: () => ipcRenderer.invoke('caption:download'),
@@ -35,10 +35,21 @@ const api: FreecutApi = {
   backgroundStatus: () => ipcRenderer.invoke('background:status'),
   downloadBackgroundModel: () => ipcRenderer.invoke('background:download'),
   removeBackground: (path) => ipcRenderer.invoke('background:remove', path),
+  onBackgroundProgress: (cb) => {
+    const listener = (_e: unknown, ratio: number) => cb(ratio)
+    ipcRenderer.on('background:progress', listener)
+    return () => ipcRenderer.removeListener('background:progress', listener)
+  },
   saveProjectDialog: (defaultName) => ipcRenderer.invoke('project:saveDialog', defaultName),
   openProjectDialog: () => ipcRenderer.invoke('project:openDialog'),
   openProjectAtPath: (path) => ipcRenderer.invoke('project:open', path),
   writeProject: (path, project) => ipcRenderer.invoke('project:write', path, project),
+  lockProject: (path) => ipcRenderer.invoke('project:lock', path),
+  findMissingMedia: (paths) => ipcRenderer.invoke('media:findMissing', paths),
+  locateMedia: (missingPath, otherMissing) => ipcRenderer.invoke('media:locate', missingPath, otherMissing),
+  cacheUsage: () => ipcRenderer.invoke('cache:usage'),
+  cleanCache: (maxAgeDays, recentProjectPaths, openAssetPaths) => ipcRenderer.invoke('cache:clean', maxAgeDays, recentProjectPaths, openAssetPaths),
+  revealCache: () => ipcRenderer.invoke('cache:reveal'),
   exportDialog: (defaultName) => ipcRenderer.invoke('export:dialog', defaultName),
   exportProject: (project, outputPath) => ipcRenderer.invoke('export:run', project, outputPath),
   onExportProgress: (cb) => {

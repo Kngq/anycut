@@ -403,6 +403,21 @@ export interface MediaClip extends ClipBase {
   /** Holds a single source frame (at trimIn) for `duration` seconds. When true, trimIn/trimOut
    *  stay pinned together and `duration` is an authored value, not derived from trim/speed. */
   frozen: boolean
+  /** A processed stand-in for this clip's source (e.g. a background-removed ProRes 4444 bake),
+   *  used by BOTH preview and export instead of the asset's own file. CapCut does the same thing by
+   *  swapping the timeline material's `path` to a cache output while the bin entry keeps the
+   *  original. It must cover the same source timeline as the asset (frame-for-frame), so trimIn/
+   *  trimOut stay valid. Absent = use the asset's file. */
+  sourceOverride?: {
+    path: string
+    /** Browser-playable copy of `path` for the live preview (e.g. VP9+alpha WebM, since Chromium
+     *  can't decode ProRes 4444). Export always uses `path`. */
+    previewPath?: string
+    /** What produced it, for the UI ("Background removed"). */
+    kind: 'backgroundRemoved'
+    /** Whether the override file carries an alpha channel (ProRes 4444 / WebM). */
+    hasAlpha: boolean
+  }
 }
 
 export interface TextClip extends ClipBase {
@@ -470,6 +485,47 @@ export function fileExtension(filePath: string): string {
   const base = filePath.split(/[/\\]/).pop() ?? filePath
   const dot = base.lastIndexOf('.')
   return dot >= 0 ? base.slice(dot).toLowerCase() : ''
+}
+
+/**
+ * Returns a copy of the project where every clip with a `sourceOverride` points at a synthetic
+ * asset whose `path` is the override file. Export runs on this "resolved" project so its per-asset
+ * input dedup keeps working: two clips sharing one baked file share one ffmpeg input, and a clip
+ * without an override still shares the original asset's input with its siblings.
+ */
+export function resolveSourceOverrides(project: Project): Project {
+  return resolveSourceOverridesWithAudio(project).project
+}
+
+/**
+ * Same as resolveSourceOverrides, plus `audioAssetFor`: synthetic asset id → the ORIGINAL asset id.
+ * A bake like background removal changes pixels, not sound, and may not even carry an audio stream,
+ * so export must keep reading audio from the original source.
+ */
+export function resolveSourceOverridesWithAudio(project: Project): { project: Project; audioAssetFor: Map<string, string> } {
+  const audioAssetFor = new Map<string, string>()
+  const extra: MediaAsset[] = []
+  const byKey = new Map<string, string>()
+  const assetById = new Map(project.assets.map((a) => [a.id, a]))
+  const tracks = project.tracks.map((t) => ({
+    ...t,
+    clips: t.clips.map((c) => {
+      if (c.kind !== 'media' || !c.sourceOverride) return c
+      const base = assetById.get(c.assetId)
+      if (!base) return c
+      const key = `${c.assetId}|${c.sourceOverride.path}`
+      let id = byKey.get(key)
+      if (!id) {
+        id = `${c.assetId}::override::${extra.length}`
+        byKey.set(key, id)
+        extra.push({ ...base, id, path: c.sourceOverride.path, previewPath: undefined })
+        audioAssetFor.set(id, c.assetId)
+      }
+      return { ...c, assetId: id }
+    })
+  }))
+  if (extra.length === 0) return { project, audioAssetFor }
+  return { project: { ...project, tracks, assets: [...project.assets, ...extra] }, audioAssetFor }
 }
 
 export function projectDuration(project: Project): number {

@@ -22,6 +22,23 @@ export interface ExportResult {
   error?: string
 }
 
+/** A project read from disk. `recoveredFromBackup` = the main file was unreadable and the `.bak`
+ *  from the previous save was used. `lockedBy` = PID of another freecut process that has it open. */
+export interface OpenedProject {
+  path: string
+  project: Project
+  recoveredFromBackup?: boolean
+  lockedBy?: number
+}
+
+export type CacheKind = 'mediainfo' | 'thumbnails' | 'waveforms' | 'proxies' | 'remux' | 'mattes'
+
+export interface CacheUsage {
+  root: string
+  kinds: Record<CacheKind, { files: number; bytes: number }>
+  totalBytes: number
+}
+
 /** One transcribed caption line, in timeline seconds. */
 export interface CaptionSegment {
   start: number
@@ -49,6 +66,8 @@ export interface BackgroundStatus {
 export interface BackgroundResult {
   ok: boolean
   outputPath?: string
+  /** Browser-playable (VP9+alpha WebM) copy for the preview. */
+  previewPath?: string
   error?: string
 }
 
@@ -64,14 +83,28 @@ export interface FreecutApi {
   /** A single cover image for a timeline clip — the first frame of a video (extracted locally
    *  with the bundled ffmpeg), or the image file itself for image assets. Null for audio-only
    *  sources or on failure. Cached on disk per source. Fully offline — no network. */
-  generateThumbnails(path: string): Promise<ThumbnailCover | null>
+  generateThumbnails(path: string, duration?: number): Promise<ThumbnailCover | null>
   /** Normalized audio peak magnitudes for a timeline waveform. Null for silent/failed sources.
    *  Cached on disk per source. */
   generateWaveform(path: string): Promise<Waveform | null>
   saveProjectDialog(defaultName: string): Promise<string | null>
-  openProjectDialog(): Promise<{ path: string; project: Project } | null>
-  openProjectAtPath(path: string): Promise<{ path: string; project: Project } | null>
+  openProjectDialog(): Promise<OpenedProject | null>
+  openProjectAtPath(path: string): Promise<OpenedProject | null>
   writeProject(path: string, project: Project): Promise<boolean>
+  /** Moves the advisory project lock to `path` (null releases it). Returns another live PID if
+   *  that project is already open in a different freecut process. */
+  lockProject(path: string | null): Promise<number | undefined>
+  /** Subset of `paths` that don't exist on disk (offline media). */
+  findMissingMedia(paths: string[]): Promise<string[]>
+  /** Lets the user locate one missing file; also auto-finds siblings in the picked folder.
+   *  Returns oldPath → newPath, or null if cancelled. */
+  locateMedia(missingPath: string, otherMissing: string[]): Promise<Record<string, string> | null>
+  /** Size of each derived-media cache (proxies, filmstrips, waveforms, probe results, remuxes). */
+  cacheUsage(): Promise<CacheUsage>
+  /** Deletes cache entries unused for `maxAgeDays` (0 = clear all), protecting media referenced by
+   *  `recentProjectPaths` and the currently open project's `openAssetPaths`. */
+  cleanCache(maxAgeDays: number, recentProjectPaths: string[], openAssetPaths: string[]): Promise<{ removedFiles: number; freedBytes: number }>
+  revealCache(): Promise<boolean>
   exportDialog(defaultName: string): Promise<string | null>
   exportProject(project: Project, outputPath: string): Promise<ExportResult>
   onExportProgress(cb: (progress: ExportProgress) => void): () => void
@@ -83,6 +116,8 @@ export interface FreecutApi {
   backgroundStatus(): Promise<BackgroundStatus>
   downloadBackgroundModel(): Promise<{ ok: boolean; error?: string }>
   removeBackground(path: string): Promise<BackgroundResult>
+  /** Progress (0..1) of the running background-removal bake. Returns an unsubscribe. */
+  onBackgroundProgress(cb: (ratio: number) => void): () => void
   fileUrl(path: string): string
   /** Absolute path of a File from a drag-and-drop (File.path was removed in Electron 32). */
   getPathForFile(file: File): string
