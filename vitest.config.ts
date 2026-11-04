@@ -1,8 +1,8 @@
 import { defineConfig } from 'vitest/config'
 import path from 'node:path'
 
-// Separate from vite.config.ts on purpose: the app's config pulls in the Electron build
-// plugins, which the pure-function unit tests under src/shared have no need for.
+// Dedicated test config: vite.config.ts pulls in the Electron build plugins, which aren't needed
+// (and try to spawn Electron) for unit tests. Covers renderer/shared AND main-process pure logic.
 export default defineConfig({
   resolve: {
     alias: {
@@ -10,6 +10,6 @@ export default defineConfig({
     }
   },
   test: {
-    include: ['src/**/*.test.ts']
+    include: ['src/**/*.test.ts', 'electron/**/*.test.ts']
   }
 })

@@ -1,10 +1,7 @@
 import { spawn } from 'node:child_process'
-import fs from 'node:fs/promises'
-import path from 'node:path'
-import crypto from 'node:crypto'
-import { app } from 'electron'
 import ffmpegPath from 'ffmpeg-static'
 import type { Waveform } from '@shared/ipc'
+import { cacheKey, dedupe, entryPath, readJsonEntry, stampSource, writeFileAtomic, writeMeta } from './cache'
 
 /**
  * Extracts an audio-waveform peak summary for a media file: decodes to mono 8 kHz PCM (s16le) and
@@ -13,51 +10,33 @@ import type { Waveform } from '@shared/ipc'
  * and is plenty of resolution once scaled across a clip — the renderer resamples to the clip's
  * pixel width.
  *
- * Cached in the OS temp dir with the same sha1(path:mtime:size) key + atomic-rename + in-flight
- * dedupe pattern as the preview proxy (see proxy.ts for why temp and not userData).
+ * Cached in `<userData>/Cache/waveforms/<key>.json` (see cache.ts). CapCut keeps waveforms the
+ * same way (`Cache/audioWave/<hash>.waveDataV2`) instead of recomputing them.
  */
 const BUCKET_COUNT = 400
 const SAMPLE_RATE = 8000
 
-const inFlight = new Map<string, Promise<Waveform | null>>()
-
 export async function ensureWaveform(filePath: string): Promise<Waveform | null> {
   if (!ffmpegPath) return null
-
-  const stat = await fs.stat(filePath).catch(() => null)
-  if (!stat) return null
-
-  const key = crypto.createHash('sha1').update(`wf:${filePath}:${stat.mtimeMs}:${stat.size}`).digest('hex')
-  const existing = inFlight.get(key)
-  if (existing) return existing
-
-  const promise = buildWaveform(filePath, key).finally(() => inFlight.delete(key))
-  inFlight.set(key, promise)
-  return promise
-}
-
-async function buildWaveform(filePath: string, key: string): Promise<Waveform | null> {
-  const dir = path.join(app.getPath('temp'), 'freecut-waveforms')
-  await fs.mkdir(dir, { recursive: true })
-  const outPath = path.join(dir, `${key}.json`)
-
-  const cached = await fs.readFile(outPath, 'utf-8').then(
-    (raw) => JSON.parse(raw) as Waveform,
-    () => null
-  )
-  if (cached) return cached
-
-  try {
-    const pcm = await decodePcm(filePath)
-    if (!pcm || pcm.length === 0) return null
-    const peaks = reduceToPeaks(pcm, BUCKET_COUNT)
-    const waveform: Waveform = { peaks }
-    await fs.writeFile(outPath, JSON.stringify(waveform), 'utf-8')
-    return waveform
-  } catch (err) {
-    console.error('[freecut] waveform generation failed for', filePath, err)
-    return null
-  }
+  const src = await stampSource(filePath)
+  if (!src) return null
+  const key = cacheKey('waveforms', src)
+  return dedupe(`waveforms:${key}`, async () => {
+    const outPath = await entryPath('waveforms', key, '.json')
+    const cached = await readJsonEntry<Waveform>(outPath)
+    if (cached) return cached
+    try {
+      const pcm = await decodePcm(filePath)
+      if (!pcm || pcm.length === 0) return null
+      const waveform: Waveform = { peaks: reduceToPeaks(pcm, BUCKET_COUNT) }
+      await writeFileAtomic(outPath, JSON.stringify(waveform))
+      await writeMeta('waveforms', key, src)
+      return waveform
+    } catch (err) {
+      console.error('[freecut] waveform generation failed for', filePath, err)
+      return null
+    }
+  })
 }
 
 /** Runs ffmpeg to produce raw mono 16-bit little-endian PCM on stdout and collects it. */
@@ -74,8 +53,11 @@ function decodePcm(filePath: string): Promise<Int16Array | null> {
       if (code !== 0) return reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-300)}`))
       const buf = Buffer.concat(chunks)
       if (buf.length < 2) return resolve(null)
-      // Reinterpret the byte buffer as Int16. byteOffset/length guard against an odd trailing byte.
-      const samples = new Int16Array(buf.buffer, buf.byteOffset, Math.floor(buf.length / 2))
+      // Copy into a fresh Int16Array: viewing buf.buffer directly throws when buf.byteOffset is
+      // odd (Buffer.concat may return a slice of the shared pool at any offset).
+      const n = Math.floor(buf.length / 2)
+      const samples = new Int16Array(n)
+      for (let i = 0; i < n; i++) samples[i] = buf.readInt16LE(i * 2)
       resolve(samples)
     })
   })
