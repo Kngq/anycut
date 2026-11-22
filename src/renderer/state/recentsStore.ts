@@ -6,7 +6,7 @@ export interface RecentProject {
   updatedAt: number
 }
 
-const STORAGE_KEY = 'freecut.recentProjects'
+const STORAGE_KEY = 'anycut.recentProjects'
 const MAX_RECENTS = 12
 
 function load(): RecentProject[] {

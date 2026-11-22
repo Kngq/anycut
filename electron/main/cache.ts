@@ -2,6 +2,8 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { app } from 'electron'
+import { sourceOverrideFiles } from '@shared/motionBlur'
+import type { SourceOverride } from '@shared/types'
 
 /**
  * Persistent, content-keyed cache for derived media artifacts (probe results, filmstrip sprites,
@@ -16,23 +18,24 @@ import { app } from 'electron'
  *    entry belongs to.
  *
  * Location: `<userData>/Cache/<kind>/`. Earlier builds used the OS temp dir because the
- * freecut-media:// handler used net.fetch, which couldn't read userData. The handler now reads
+ * anycut-media:// handler used net.fetch, which couldn't read userData. The handler now reads
  * with Node fs (see mediaProtocol.ts), so that constraint is gone. The OS can also wipe temp at
  * any time, which threw away proxies and forced re-transcodes.
  */
 
-export type CacheKind = 'mediainfo' | 'thumbnails' | 'waveforms' | 'proxies' | 'remux' | 'mattes'
+export type CacheKind = 'mediainfo' | 'thumbnails' | 'waveforms' | 'proxies' | 'remux' | 'mattes' | 'motionblur'
 
-export const CACHE_KINDS: CacheKind[] = ['mediainfo', 'thumbnails', 'waveforms', 'proxies', 'remux', 'mattes']
+export const CACHE_KINDS: CacheKind[] = ['mediainfo', 'thumbnails', 'waveforms', 'proxies', 'remux', 'mattes', 'motionblur']
 
 /** Bump when an artifact's on-disk format or generation params change, so old entries are ignored. */
 const KIND_VERSION: Record<CacheKind, string> = {
-  mediainfo: 'v1',
-  thumbnails: 'v2', // 40-frame sprite at 120px
+  mediainfo: 'v2', // + colour metadata
+  thumbnails: 'v3', // 40-frame sprite at 120px; v3: HDR tone-mapped, Rec. 709 matrix
   waveforms: 'v1',
-  proxies: 'v1',
+  proxies: 'v2', // v2: HDR tone-mapped + Rec. 709 tags
   remux: 'v1',
-  mattes: 'v1' // background-removed ProRes 4444 bakes
+  mattes: 'v1', // background-removed ProRes 4444 bakes
+  motionblur: 'v1' // Video > Motion blur bakes (H.264, or ProRes 4444 + WebM over an alpha source)
 }
 
 export function cacheRoot(): string {
@@ -117,14 +120,14 @@ export async function protectedSourcesFor(projectPaths: string[]): Promise<strin
     try {
       const project = JSON.parse(await fs.readFile(p, 'utf-8')) as {
         assets?: { path?: string }[]
-        tracks?: { clips?: { sourceOverride?: { path?: string; previewPath?: string } }[] }[]
+        tracks?: { clips?: { sourceOverride?: SourceOverride }[] }[]
       }
       for (const a of project.assets ?? []) if (a.path) out.add(a.path)
       // Baked stand-ins (e.g. background removed) are referenced directly; protect the files.
       for (const t of project.tracks ?? [])
         for (const c of t.clips ?? []) {
-          if (c.sourceOverride?.path) out.add(c.sourceOverride.path)
-          if (c.sourceOverride?.previewPath) out.add(c.sourceOverride.previewPath)
+          // Includes the bake a motion blur sits on (restored by "Remove motion blur").
+          for (const f of sourceOverrideFiles(c.sourceOverride)) out.add(f)
         }
     } catch {
       // Missing/corrupt project file: nothing to protect from it.

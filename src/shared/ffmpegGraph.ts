@@ -1,7 +1,12 @@
-import { clipSpeedSegments, fontCatalogEntry, resolveSourceOverridesWithAudio, type Clip, type ClipTransform, type MediaAsset, type MediaClip, type Project, type Track } from './types'
+import { clipSpeedSegments, fontCatalogEntry, isFullCrop, resolveSourceOverridesWithAudio, type Clip, type ClipTransform, type MediaAsset, type MediaClip, type Project, type Track } from './types'
+import { animatedTransform } from './animations'
+import { buildLut, filterDef, filterFinish, LUT_SIZE, lutFileName, lutToCube, vignetteAngle } from './filters'
 import { effectNeedsSubgraph, effectToFfmpegFilters, mirrorSubgraph, transitionToXfade } from './effects'
 
 export interface FfmpegPlan {
+  /** Files the filter graph reads (filter LUTs), keyed by absolute path; write them before
+   *  running ffmpeg (writePlanFiles in electron/main/export.ts). */
+  files?: { path: string; content: string }[]
   inputs: string[] // -i arguments, in order; filter graph refers to them as [0:v], [1:v], etc.
   filterComplex: string
   videoOutLabel: string
@@ -23,6 +28,44 @@ function escapeDrawtext(text: string): string {
     .replace(/\n/g, ' ')
 }
 
+/** ffprobe transfer names for HDR: HLG and PQ. */
+const HDR_TRANSFERS = new Set(['arib-std-b67', 'smpte2084'])
+/** Matrices/primaries that aren't Rec. 709 but are SDR (SD Rec. 601, Rec. 2020 SDR). */
+const NON_709_SDR = new Set(['smpte170m', 'bt470bg', 'bt470m', 'bt2020', 'bt2020nc', 'bt2020c', 'bt601'])
+
+/**
+ * Filters (comma-terminated, or '') that convert one source into Rec. 709 SDR, the project's
+ * colour space. Untagged and Rec. 709 sources pass through untouched. HDR (HLG/PQ, e.g. iPhone
+ * Dolby Vision/HLG clips) is linearised, gamut-mapped to Rec. 709 primaries and tone-mapped
+ * (Hable) down to SDR; tagged SD/Rec. 2020 SDR sources get a primaries+matrix conversion.
+ */
+export function colorConversionFilters(color: MediaAsset['color']): string {
+  if (!color) return ''
+  if (color.transfer && HDR_TRANSFERS.has(color.transfer)) {
+    // Input tags are spelled out (not read from the frame) so this also works after a scale or
+    // other filter that drops the frame's colour properties.
+    const tin = color.transfer
+    const min = color.matrix && color.matrix !== 'unknown' ? color.matrix : 'bt2020nc'
+    const pin = color.primaries && color.primaries !== 'unknown' ? color.primaries : 'bt2020'
+    const rin = color.range === 'pc' ? 'full' : 'limited'
+    return `zscale=tin=${tin}:min=${min}:pin=${pin}:rin=${rin}:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,`
+  }
+  if ((color.primaries && NON_709_SDR.has(color.primaries)) || (color.matrix && NON_709_SDR.has(color.matrix))) {
+    return 'colorspace=all=bt709:fast=0,'
+  }
+  return ''
+}
+
+/** Crop (comma-terminated, or '') for a clip's crop window; sizes rounded to even pixels. */
+export function cropFilter(crop: MediaClip['crop']): string {
+  if (!crop || isFullCrop(crop)) return ''
+  const f = (v: number) => Number(v.toFixed(5))
+  return `crop=w='trunc(iw*${f(crop.w)}/2)*2':h='trunc(ih*${f(crop.h)}/2)*2':x='iw*${f(crop.x)}':y='ih*${f(crop.y)}',`
+}
+
+/** Output tagging + matrix for the final YUV conversion: everything is Rec. 709 limited range. */
+export const REC709_OUTPUT_ARGS = ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-color_range', 'tv']
+
 function sortedClips<T extends Clip>(track: Track): T[] {
   return [...track.clips].sort((a, b) => a.start - b.start) as T[]
 }
@@ -37,8 +80,26 @@ function sortedClips<T extends Clip>(track: Track): T[] {
  * position/scale/opacity (x/y/scale/opacity each get their own call), one property per
  * invocation.
  */
+/** Drops keyframes that lie on the straight line between their neighbours (and collapses a
+ *  constant track to one point), so baked animations don't bloat ffmpeg expressions. */
+function simplifyKeyframes(kfs: { time: number; value: number }[]): { time: number; value: number }[] {
+  if (kfs.length <= 2) return kfs
+  if (kfs.every((k) => Math.abs(k.value - kfs[0].value) < 1e-9)) return [kfs[0]]
+  const out = [kfs[0]]
+  for (let i = 1; i < kfs.length - 1; i++) {
+    const a = out[out.length - 1]
+    const b = kfs[i]
+    const c = kfs[i + 1]
+    const span = c.time - a.time
+    const expected = span <= 0 ? c.value : a.value + ((c.value - a.value) * (b.time - a.time)) / span
+    if (Math.abs(expected - b.value) > 1e-6) out.push(b)
+  }
+  out.push(kfs[kfs.length - 1])
+  return out
+}
+
 export function piecewiseLinearExpr(keyframes: { time: number; value: number }[], timeVar: string): string {
-  const sorted = [...keyframes].sort((a, b) => a.time - b.time)
+  const sorted = simplifyKeyframes([...keyframes].sort((a, b) => a.time - b.time))
   if (sorted.length === 0) return '0'
   if (sorted.length === 1) return String(sorted[0].value)
   let expr = String(sorted[sorted.length - 1].value)
@@ -84,9 +145,29 @@ function hasActiveKeyframes(transform: ClipTransform): boolean {
  *  - Text tracks rendered with `drawtext`, layered on top of all video.
  *  - Audio tracks and un-muted video clip audio are trimmed, delayed, and mixed with `amix`.
  */
-export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
+/** A baked text overlay: an RGBA PNG sequence from frame 0 at the project fps (see
+ *  electron/main/textOverlay.ts). When given, it replaces drawtext for every text clip. */
+export interface TextOverlayInput {
+  pattern: string
+  fps: number
+}
+
+export function buildFfmpegPlan(inputProject: Project, opts: { textOverlay?: TextOverlayInput; lutDir?: string } = {}): FfmpegPlan {
   // Clips with a baked stand-in (e.g. background removed) render from that file instead.
-  const { project, audioAssetFor } = resolveSourceOverridesWithAudio(inputProject)
+  const resolved = resolveSourceOverridesWithAudio(inputProject)
+  const audioAssetFor = resolved.audioAssetFor
+  // Deactivated clips: dropped from every track except the main video roll, where they stay as
+  // black (the roll is a contiguous sequence, so later clips keep their timing).
+  const firstVideoId = resolved.project.tracks.find((t) => t.type === 'video')?.id
+  const project: Project = {
+    ...resolved.project,
+    tracks: resolved.project.tracks.map((t) => {
+      const clips = t.id === firstVideoId ? t.clips : t.clips.filter((c) => !c.disabled)
+      // Animation presets become ordinary transform keyframes (shared/animations.ts), the same
+      // ones the preview plays, so everything below only ever sees keyframed transforms.
+      return { ...t, clips: clips.map((c) => (c.kind === 'media' && c.animations ? { ...c, transform: animatedTransform(c) } : c)) }
+    })
+  }
   const { width, height, fps } = project.canvas
   const assetById = new Map(project.assets.map((a) => [a.id, a]))
 
@@ -131,59 +212,79 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
     `scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
     `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps}`
 
+  /** Bounding box of a w×h frame rotated by `degrees` (what Preview's ctx.rotate covers). */
+  function rotatedBox(w: number, h: number, degrees: number): { w: number; h: number } {
+    const r = (degrees * Math.PI) / 180
+    const c = Math.abs(Math.cos(r))
+    const s = Math.abs(Math.sin(r))
+    return { w: w * c + h * s, h: w * s + h * c }
+  }
+  const even = (v: number) => Math.max(2, 2 * Math.round(v / 2))
+  const normRotation = (clip: MediaClip) => (((clip.transform.rotation ?? 0) % 360) + 360) % 360
+
   /**
-   * Scale+pan/zoom+fade a primary-track clip's already canvas-sized frame around its (possibly
-   * keyframed) transform. Geometry: scale the whole canvasW x canvasH frame up by `scale`
-   * (never below 1x — a primary-track clip fills the frame, so shrinking it would leave
-   * nothing to crop from; below-1x scale on the primary track is a known, narrow limitation,
-   * not a crash) using ffmpeg's per-frame `eval=frame` scale when keyframed (empirically
-   * verified: scale really does resize every frame, not just at init, and the dimensions
-   * propagate correctly into a following `crop`), then `crop` back down to canvasW x canvasH
-   * with the crop window's center anchored at the transform's (x,y) — `clip(...)` keeps the
-   * crop origin in bounds. Opacity fades the frame toward black (there's nothing "behind" the
-   * primary track to blend with — this matches Preview.tsx's black canvas background).
+   * Places a primary-track clip's canvas-fit (and already rotated/mirrored) frame on a black
+   * canvas exactly the way Preview.tsx's drawContain does: scale around the fit size by
+   * `transform.scale` (any value — below 1x leaves black around it), center it at
+   * (x·W, y·H) (anywhere — off-canvas positions slide it out of frame), then fade toward black by
+   * `opacity` (nothing sits behind the primary track). Scale and position are `eval=frame`
+   * expressions when keyframed (animations are baked to keyframes upstream); the composite is an
+   * `overlay` onto a W×H black `color` source, which tracks the per-frame size of a dynamically
+   * scaled input (see compositeOverlayClip for why overlay rather than crop/pad). The segment's
+   * own timestamps start at 0, so `t` is clip-local time.
+   *
    * No-op (returns `label` unchanged) at the default transform, so untransformed primary-track
    * clips produce byte-identical filter output to before this feature existed.
    */
   function applyCanvasTransform(label: string, clip: MediaClip): string {
     const transform = clip.transform
     const hasKf = hasActiveKeyframes(transform)
-    const isDefaultGeometry = !hasKf && transform.x === 0.5 && transform.y === 0.5 && transform.scale === 1
-    const isDefaultOpacity = !hasKf && transform.opacity === 1
+    const kfs = transform.keyframes ?? []
+    const rotation = normRotation(clip)
+    const isDefaultGeometry = !hasKf && transform.x === 0.5 && transform.y === 0.5 && transform.scale === 1 && rotation === 0
+    const opacityConst = hasKf ? (kfs.every((k) => k.opacity === kfs[0].opacity) ? kfs[0].opacity : null) : transform.opacity
+    const isDefaultOpacity = opacityConst === 1
     if (isDefaultGeometry && isDefaultOpacity) return label
 
     let out = label
 
     if (!isDefaultGeometry) {
-      const kfs = transform.keyframes!
       const scaleExpr = hasKf ? piecewiseLinearExpr(kfs.map((k) => ({ time: k.time, value: k.scale })), 't') : String(transform.scale)
       const xExpr = hasKf ? piecewiseLinearExpr(kfs.map((k) => ({ time: k.time, value: k.x })), 't') : String(transform.x)
       const yExpr = hasKf ? piecewiseLinearExpr(kfs.map((k) => ({ time: k.time, value: k.y })), 't') : String(transform.y)
-
+      // The rotated frame is its bounding box (applyRotateFlip grows it), so size from that.
+      const box = rotatedBox(width, height, rotation)
       const scaled = nextLabel('zoomscale')
       if (hasKf) {
-        filters.push(`[${out}]scale=w='${width}*max(${scaleExpr},1)':h='${height}*max(${scaleExpr},1)':eval=frame[${scaled}]`)
+        filters.push(
+          `[${out}]scale=w='max(2,2*trunc(${box.w.toFixed(3)}*(${scaleExpr})/2))':h='max(2,2*trunc(${box.h.toFixed(3)}*(${scaleExpr})/2))':eval=frame[${scaled}]`
+        )
       } else {
-        const s = Math.max(transform.scale, 1)
-        filters.push(`[${out}]scale=${Math.round(width * s)}:${Math.round(height * s)}[${scaled}]`)
+        filters.push(`[${out}]scale=${even(box.w * transform.scale)}:${even(box.h * transform.scale)}[${scaled}]`)
       }
-      out = scaled
-
-      const cropped = nextLabel('zoomcrop')
+      const bg = nextLabel('zoombg')
+      // A little longer than the clip; overlay's shortest=1 ends the composite with the clip.
+      filters.push(`color=c=black:s=${width}x${height}:r=${fps}:d=${(clip.duration + 1).toFixed(3)},setsar=1[${bg}]`)
+      const placed = nextLabel('zoomplace')
       filters.push(
-        `[${out}]crop=${width}:${height}:'clip(iw*(${xExpr})-${width}/2,0,iw-${width})':'clip(ih*(${yExpr})-${height}/2,0,ih-${height})'[${cropped}]`
+        `[${bg}][${scaled}]overlay=x='${width}*(${xExpr})-w/2':y='${height}*(${yExpr})-h/2':eval=frame:shortest=1:format=auto,format=yuv420p,setsar=1[${placed}]`
       )
-      out = cropped
+      out = placed
     }
 
     if (!isDefaultOpacity) {
-      const kfs = transform.keyframes!
       const opaced = nextLabel('zoomop')
-      if (hasKf) {
-        const opacityExpr = piecewiseLinearExpr(kfs.map((k) => ({ time: k.time, value: k.opacity })), 'T')
-        filters.push(`[${out}]geq=r='r(X,Y)*(${opacityExpr})':g='g(X,Y)*(${opacityExpr})':b='b(X,Y)*(${opacityExpr})'[${opaced}]`)
+      if (opacityConst !== null) {
+        filters.push(`[${out}]colorchannelmixer=rr=${opacityConst}:gg=${opacityConst}:bb=${opacityConst}[${opaced}]`)
       } else {
-        filters.push(`[${out}]colorchannelmixer=rr=${transform.opacity}:gg=${transform.opacity}:bb=${transform.opacity}[${opaced}]`)
+        // geq is per-pixel, so only run it while the opacity is actually below 1.
+        const dim = kfs.filter((k) => k.opacity < 1)
+        const from = Math.max(0, Math.min(...dim.map((k) => k.time)) - 0.05)
+        const to = Math.max(...dim.map((k) => k.time)) + 0.05
+        const opacityExpr = piecewiseLinearExpr(kfs.map((k) => ({ time: k.time, value: k.opacity })), 'T')
+        filters.push(
+          `[${out}]geq=lum='lum(X,Y)*(${opacityExpr})':cb='128+(cb(X,Y)-128)*(${opacityExpr})':cr='128+(cr(X,Y)-128)*(${opacityExpr})':enable='between(t,${from.toFixed(3)},${to.toFixed(3)})'[${opaced}]`
+        )
       }
       out = opaced
     }
@@ -193,37 +294,37 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
 
   /**
    * Returns one label holding the clip's trimmed, speed-adjusted, (optionally reversed) video,
-   * finished per `finish`: 'canvas' scales/pads to fill the full canvas (then applies any
-   * primary-track pan/zoom/fade transform) — the primary-track shape; 'native' only normalizes
-   * fps/SAR, leaving the clip at its native asset resolution for the caller to position itself
-   * (see overlayCompositeLabel) — the overlay-track shape. A flat (no curve) 1x-speed,
-   * non-reversed, untransformed 'canvas' clip produces exactly the single trim/setpts/scale
-   * chain this did before speed/reverse/transform existed; anything else (a curve, non-1x flat
-   * speed, `reversed`, or a non-default transform) assembles the clip from clipSpeedSegments()
-   * (one constant-speed trim+setpts per segment, concatenated — always in ascending SOURCE-time
-   * order regardless of `reversed`), then applies a single `reverse` filter to the whole
-   * assembled (still-forward) result before the finish step — reverse is a final flip, never
-   * per-segment, so it composes correctly with any speed curve.
+   * finished per `finish`: 'canvas' scales/pads to fill the full canvas, then mirrors/rotates,
+   * places it per its transform (applyCanvasTransform) and runs its effects over the whole
+   * frame — the primary-track shape, in the same order Preview draws it; 'native' only
+   * normalizes fps/SAR, leaving the clip at its native asset resolution for the caller to
+   * position itself (see compositeOverlayClip) — the overlay-track shape. A flat (no curve)
+   * 1x-speed, non-reversed, untransformed 'canvas' clip produces exactly the single
+   * trim/setpts/scale chain this did before speed/reverse/transform existed; anything else (a
+   * curve, non-1x flat speed, `reversed`, or a non-default transform) assembles the clip from
+   * clipSpeedSegments() (one constant-speed trim+setpts per segment, concatenated — always in
+   * ascending SOURCE-time order regardless of `reversed`), then applies a single `reverse` filter
+   * to the whole assembled (still-forward) result before the finish step — reverse is a final
+   * flip, never per-segment, so it composes correctly with any speed curve.
    */
   function trimmedSegmentLabel(clip: MediaClip, asset: MediaAsset, finish: 'canvas' | 'native' = 'canvas'): string {
     const finishFilter = finish === 'native' ? `setsar=1,fps=${fps}` : scalePadFor()
     const base = buildBaseSegment(clip, asset, finishFilter)
-    const transformed = finish === 'canvas' ? applyCanvasTransform(base, clip) : base
-    const withEffects = applyEffectsChain(transformed, clip)
-    return applyRotateFlip(withEffects, clip, finish)
+    if (finish === 'canvas') return applyEffectsChain(applyCanvasTransform(applyRotateFlip(base, clip, 'canvas'), clip), clip)
+    return applyRotateFlip(applyEffectsChain(base, clip), clip, 'native')
   }
 
   /**
-   * Applies the clip's static horizontal mirror (`flipH`) and 90°-step rotation (`rotation`)
-   * from its transform — the timeline toolbar's Mirror/Rotate buttons. Mirrors drawContain in
-   * Preview.tsx: flip first, then rotate about the center. For a primary ('canvas') clip the
-   * rotate output stays pinned to the canvas size (ow/oh) with black-filled corners, matching
-   * the preview; for an overlay ('native') clip the rotate keeps the clip's own dimensions so
-   * the later overlay composite still fits it correctly. No-op at the default (rotation 0,
+   * Applies the clip's horizontal mirror (`flipH`) and rotation (`rotation`, any angle) from its
+   * transform. Mirrors drawContain in Preview.tsx: flip, then rotate about the center, keeping
+   * the whole rotated frame — the output grows to the rotated bounding box. A primary ('canvas')
+   * clip's corners fill black (applyCanvasTransform then crops it back onto the canvas); an
+   * overlay ('native') clip's corners are transparent so what's beneath shows through, and
+   * compositeOverlayClip sizes it from the same bounding box. No-op at the default (rotation 0,
    * flipH false), so untouched clips emit identical output to before.
    */
   function applyRotateFlip(label: string, clip: MediaClip, finish: 'canvas' | 'native'): string {
-    const rotation = (((clip.transform.rotation ?? 0) % 360) + 360) % 360
+    const rotation = normRotation(clip)
     const flipH = clip.transform.flipH ?? false
     if (rotation === 0 && !flipH) return label
     let current = label
@@ -234,9 +335,13 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
     }
     if (rotation !== 0) {
       const out = nextLabel('rot')
-      const radians = (rotation * Math.PI) / 180
-      const sizeArgs = finish === 'canvas' ? `:ow=${width}:oh=${height}` : ''
-      filters.push(`[${current}]rotate=${radians.toFixed(6)}${sizeArgs}:fillcolor=black[${out}]`)
+      const radians = ((rotation * Math.PI) / 180).toFixed(6)
+      if (finish === 'canvas') {
+        const box = rotatedBox(width, height, rotation)
+        filters.push(`[${current}]rotate=${radians}:ow=${even(box.w)}:oh=${even(box.h)}:fillcolor=black[${out}]`)
+      } else {
+        filters.push(`[${current}]format=rgba,rotate=${radians}:ow='rotw(${radians})':oh='roth(${radians})':fillcolor=none[${out}]`)
+      }
       current = out
     }
     // Primary-track clips flow into concat/xfade, which reject a non-1 SAR ("SAR … do not
@@ -283,9 +388,45 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
     return normalized
   }
 
+  const planFiles = new Map<string, string>()
+  const lutDir = (opts.lutDir ?? '.').replace(/\/+$/, '')
+  /**
+   * The clip's Filter (shared/filters.ts) as a filter-chain prefix (ending in a comma), applied
+   * to the clip's own pixels before it's fitted to the canvas, like the preview's WebGL pass.
+   * Colour: the filter's LUT (intensity baked in) through `lut3d` in RGB, converting with the
+   * Rec. 709 matrix both ways (swscale would otherwise assume 601). Then the spatial finish in
+   * YUV: unsharp / gblur sized to the source, temporal noise, cos⁴ vignette.
+   */
+  function clipFilterChain(clip: MediaClip, asset: MediaAsset): string {
+    const def = clip.filter ? filterDef(clip.filter.id) : undefined
+    const intensity = clip.filter ? Math.min(1, Math.max(0, clip.filter.intensity)) : 0
+    if (!def || intensity <= 0) return ''
+    const name = lutFileName(def.id, intensity)
+    const path = `${lutDir}/${name}`
+    if (!planFiles.has(path)) planFiles.set(path, lutToCube(buildLut(def, intensity), LUT_SIZE, def.label))
+    const alpha = asset.kind === 'image' || !!clip.sourceOverride?.hasAlpha
+    const fin = filterFinish(def, intensity)
+    const srcH = Math.max(1, (asset.height || height) * (clip.crop && !isFullCrop(clip.crop) ? clip.crop.h : 1))
+    const parts = [
+      `scale=in_color_matrix=bt709:in_range=tv,format=${alpha ? 'rgba' : 'rgb24'}`,
+      `lut3d=file='${path}':interp=trilinear`,
+      `scale=out_color_matrix=bt709:out_range=tv,format=${alpha ? 'yuva420p' : 'yuv420p'}`
+    ]
+    if (fin.sharpen > 0) parts.push(`unsharp=5:5:${(fin.sharpen * 1.6).toFixed(3)}:5:5:0`)
+    if (fin.soften > 0) parts.push(`gblur=sigma=${(fin.soften * 0.004 * srcH).toFixed(2)}`)
+    if (fin.grain > 0) parts.push(`noise=c0s=${Math.round(fin.grain * 22)}:c0f=t`)
+    if (fin.vignette > 0) parts.push(`vignette=angle=${vignetteAngle(fin.vignette).toFixed(4)}`)
+    return parts.join(',') + ','
+  }
+
   function buildBaseSegment(clip: MediaClip, asset: MediaAsset, finishFilter: string): string {
     const ref = inputFor(clip.assetId)
     const segLabel = nextLabel('vseg')
+    // Colour conversion to Rec. 709 and the crop run on the trimmed frames, before fit/scale.
+    // Still images decode as RGB; convert to YUV with the Rec. 709 matrix (swscale's implicit
+    // conversion would use 601 and shift every colour).
+    const rgbIn = asset.kind === 'image' ? 'scale=out_color_matrix=bt709:out_range=tv,format=yuva420p,' : ''
+    finishFilter = rgbIn + colorConversionFilters(asset.color) + cropFilter(clip.crop) + clipFilterChain(clip, asset) + finishFilter
     if (asset.kind === 'image') {
       filters.push(`[${ref.index}:v]trim=duration=${clip.duration},${finishFilter},setpts=PTS-STARTPTS[${segLabel}]`)
       return segLabel
@@ -365,11 +506,15 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
     const transform = clip.transform
     const hasKf = hasActiveKeyframes(transform)
     const kfs = transform.keyframes
-    const nativeW = asset.width || width
-    const nativeH = asset.height || height
+    const cw = clip.crop && !isFullCrop(clip.crop) ? clip.crop.w : 1
+    const ch = clip.crop && !isFullCrop(clip.crop) ? clip.crop.h : 1
+    const nativeW = Math.max(1, Math.round((asset.width || width) * cw))
+    const nativeH = Math.max(1, Math.round((asset.height || height) * ch))
     const fit = Math.min(width / nativeW, height / nativeH)
-    const baseW = Math.max(Math.round(nativeW * fit), 1)
-    const baseH = Math.max(Math.round(nativeH * fit), 1)
+    // A rotated clip arrives as its bounding box (applyRotateFlip), so size that box.
+    const box = rotatedBox(nativeW * fit, nativeH * fit, normRotation(clip))
+    const baseW = Math.max(Math.round(box.w), 1)
+    const baseH = Math.max(Math.round(box.h), 1)
     const localT = `(t-${clip.start})`
 
     const scaleExpr = hasKf ? piecewiseLinearExpr(kfs!.map((k) => ({ time: k.time, value: k.scale })), localT) : String(transform.scale)
@@ -379,7 +524,7 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
     let scaledLabel = nativeLabel
     const scaled = nextLabel('ovscale')
     if (hasKf) {
-      filters.push(`[${scaledLabel}]scale=w='${baseW}*(${scaleExpr})':h='${baseH}*(${scaleExpr})':eval=frame[${scaled}]`)
+      filters.push(`[${scaledLabel}]scale=w='max(1,${baseW}*(${scaleExpr}))':h='max(1,${baseH}*(${scaleExpr}))':eval=frame[${scaled}]`)
     } else {
       const w = Math.max(Math.round(baseW * transform.scale), 1)
       const h = Math.max(Math.round(baseH * transform.scale), 1)
@@ -437,7 +582,13 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
       for (const clip of clips) {
         const asset = assetById.get(clip.assetId)
         if (!asset) continue
-        segmentLabels.push(trimmedSegmentLabel(clip, asset))
+        if (clip.disabled) {
+          const black = nextLabel('voff')
+          filters.push(`color=c=black:s=${width}x${height}:r=${fps}:d=${clip.duration},setsar=1,format=yuv420p[${black}]`)
+          segmentLabels.push(black)
+        } else {
+          segmentLabels.push(trimmedSegmentLabel(clip, asset))
+        }
         segmentDurations.push(clip.duration)
       }
 
@@ -488,7 +639,15 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
   }
 
   // ---- Text overlays ----
-  for (const track of textTracks) {
+  if (opts.textOverlay) {
+    const index = inputCount++
+    inputs.push('-framerate', String(opts.textOverlay.fps), '-i', opts.textOverlay.pattern)
+    const out = nextLabel('txt')
+    // eof_action=pass: after the last caption frame the video continues untouched.
+    filters.push(`[${videoOutLabel}][${index}:v]overlay=0:0:format=auto:eof_action=pass[${out}]`)
+    videoOutLabel = out
+  }
+  for (const track of opts.textOverlay ? [] : textTracks) {
     const clips = sortedClips(track).filter((c): c is Clip & { kind: 'text' } => c.kind === 'text')
     for (const clip of clips) {
       const out = nextLabel('txt')
@@ -518,7 +677,10 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
       // drawtext needs an actual font FILE. Escape the path's special chars the same way the
       // text is escaped (colons/backslashes/quotes). If the file is missing on this machine,
       // ffmpeg falls back to its built-in font rather than failing the whole render.
-      parts.push(`fontfile='${escapeDrawtext(font.fontFile)}'`)
+      if (font.fontFile) parts.push(`fontfile='${escapeDrawtext(font.fontFile)}'`)
+      if (clip.stroke && clip.stroke.width > 0) {
+        parts.push(`borderw=${Math.round(clip.stroke.width * transform.scale)}`, `bordercolor=${clip.stroke.color}`)
+      }
       if (hasKf || transform.opacity !== 1) {
         const alphaStr = hasKf ? `'${piecewiseLinearExpr(kfs!.map((k) => ({ time: k.time, value: k.opacity })), localT)}'` : String(transform.opacity)
         parts.push(`alpha=${alphaStr}`)
@@ -534,7 +696,7 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
   const audioMixLabels: string[] = []
 
   function addAudioClip(clip: MediaClip, asset: MediaAsset) {
-    if (!asset.hasAudio || clip.muted || clip.volume <= 0) return
+    if (clip.disabled || !asset.hasAudio || clip.muted || clip.volume <= 0) return
     // An overridden clip (e.g. background removed) still plays the ORIGINAL file's audio.
     const ref = inputFor(audioAssetFor.get(clip.assetId) ?? clip.assetId)
     const trimmed = nextLabel('atrim')
@@ -556,7 +718,16 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
     const pieceLabels = segments.map((seg) => {
       const piece = nextLabel('aspeed')
       const factors = atempoFactors(seg.speed)
-      const tempoChain = factors.length === 1 && factors[0] === 1 ? '' : `,${factors.map((f) => `atempo=${f}`).join(',')}`
+      // "Change audio pitch": resample like a sped-up tape (pitch follows speed) instead of
+      // atempo's pitch-preserving time-stretch.
+      const tempoChain =
+        seg.speed === 1
+          ? ''
+          : clip.changeAudioPitch
+            ? `,aresample=48000,asetrate=${Math.round(48000 * seg.speed)},aresample=48000`
+            : factors.length === 1 && factors[0] === 1
+              ? ''
+              : `,${factors.map((f) => `atempo=${f}`).join(',')}`
       filters.push(`[${ref.index}:a]atrim=start=${seg.start}:end=${seg.end},asetpts=PTS-STARTPTS${tempoChain}[${piece}]`)
       return piece
     })
@@ -610,17 +781,23 @@ export function buildFfmpegPlan(inputProject: Project): FfmpegPlan {
     filterComplex: filters.join(';'),
     videoOutLabel,
     audioOutLabel,
-    videoArgs: ['-r', String(fps), '-s', `${width}x${height}`]
+    videoArgs: ['-r', String(fps), '-s', `${width}x${height}`],
+    files: [...planFiles].map(([path, content]) => ({ path, content }))
   }
 }
 
-export function planToFfmpegArgs(plan: FfmpegPlan, outputPath: string): string[] {
-  const args: string[] = ['-y', ...plan.inputs, '-filter_complex', plan.filterComplex]
-  args.push('-map', `[${plan.videoOutLabel}]`)
+/** `range` renders only [start, end) of the timeline (Export selected clips / compound clips). */
+export function planToFfmpegArgs(plan: FfmpegPlan, outputPath: string, range?: { start: number; end: number }): string[] {
+  // The final RGB/YUV conversion uses the Rec. 709 matrix explicitly; swscale's default is
+  // Rec. 601, which would shift colours (most visibly in text and RGBA overlays).
+  const filterComplex = `${plan.filterComplex};[${plan.videoOutLabel}]scale=in_color_matrix=bt709:in_range=tv:out_color_matrix=bt709:out_range=tv,format=yuv420p[vout709]`
+  const args: string[] = ['-y', ...plan.inputs, '-filter_complex', filterComplex]
+  args.push('-map', '[vout709]')
   if (plan.audioOutLabel) {
     args.push('-map', `[${plan.audioOutLabel}]`)
   }
-  args.push(...plan.videoArgs, '-c:v', 'libx264', '-pix_fmt', 'yuv420p')
+  if (range) args.push('-ss', range.start.toFixed(3), '-t', Math.max(0.05, range.end - range.start).toFixed(3))
+  args.push(...plan.videoArgs, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', ...REC709_OUTPUT_ARGS)
   if (plan.audioOutLabel) {
     args.push('-c:a', 'aac')
   } else {

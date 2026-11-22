@@ -40,3 +40,22 @@ export function readFxPayload(dt: DataTransfer): DragPayload | null {
   }
   return active
 }
+
+/**
+ * The media-bin asset being dragged, recorded for the same reason as the effect payload: the
+ * timeline needs its duration during `dragover` to draw the follow ghost, and DataTransfer data
+ * can't be read until `drop`.
+ */
+let activeAsset: string | null = null
+
+export function startAssetDrag(assetId: string) {
+  activeAsset = assetId
+}
+
+export function activeAssetDragId(): string | null {
+  return activeAsset
+}
+
+export function endAssetDrag() {
+  activeAsset = null
+}

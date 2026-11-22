@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react'
 import { useProjectStore } from '../state/projectStore'
 import { loadOpenedProject, saveProject } from '../projectIO'
 import { ASPECT_PRESETS, aspectPresetFor } from '@shared/types'
-import type { ExportProgress } from '@shared/ipc'
+import { runExport, useExportStatus } from '../export/runExport'
+import logoUrl from '../assets/logo.png'
 
 export default function Toolbar({ onGoHome }: { onGoHome: () => void }) {
   const project = useProjectStore((s) => s.project)
@@ -12,10 +12,9 @@ export default function Toolbar({ onGoHome }: { onGoHome: () => void }) {
   const playhead = useProjectStore((s) => s.playhead)
   const newProject = useProjectStore((s) => s.newProject)
 
-  const [exportState, setExportState] = useState<ExportProgress | null>(null)
-  const [exporting, setExporting] = useState(false)
-
-  useEffect(() => window.api.onExportProgress((p) => setExportState(p)), [])
+  const exporting = useExportStatus((s) => s.running)
+  const exportState = useExportStatus((s) => s.progress)
+  const exportLabel = useExportStatus((s) => s.label)
 
   async function handleNew() {
     if (dirty && !confirm('Discard unsaved changes and start a new project?')) return
@@ -45,13 +44,8 @@ export default function Toolbar({ onGoHome }: { onGoHome: () => void }) {
   async function handleExport() {
     const path = await window.api.exportDialog(project.name)
     if (!path) return
-    setExporting(true)
-    setExportState({ ratio: 0, message: 'Starting…' })
-    const result = await window.api.exportProject(project, path)
-    setExporting(false)
-    if (!result.ok) {
-      alert(`Export failed:\n${result.error}`)
-    }
+    const result = await runExport(project, path, 'Export')
+    if (!result.ok) alert(`Export failed:\n${result.error}`)
   }
 
   function addText() {
@@ -62,7 +56,11 @@ export default function Toolbar({ onGoHome }: { onGoHome: () => void }) {
   return (
     <div className="toolbar">
       <button onClick={handleGoHome}>Home</button>
-      <span className="title">freecut — {project.name}{dirty ? ' *' : ''}</span>
+      <span className="title">
+        <img className="title-logo" src={logoUrl} alt="anycut" width={18} height={18} />
+        {project.name}
+        {dirty ? ' *' : ''}
+      </span>
       <button onClick={handleNew}>New</button>
       <button onClick={handleOpen}>Open</button>
       <button onClick={handleSave}>Save</button>
@@ -92,13 +90,13 @@ export default function Toolbar({ onGoHome }: { onGoHome: () => void }) {
       <span className="spacer" />
       {exporting && exportState && (
         <>
-          <span>{exportState.message}</span>
+          <span>{exportLabel && exportLabel !== 'Export' ? `${exportLabel}: ` : ''}{exportState.message}</span>
           <div className="progress-bar">
             <div className="progress-bar-fill" style={{ width: `${Math.round(exportState.ratio * 100)}%` }} />
           </div>
         </>
       )}
-      <button onClick={handleExport} disabled={exporting}>
+      <button className="btn-primary" onClick={handleExport} disabled={exporting}>
         Export MP4
       </button>
     </div>

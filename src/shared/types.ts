@@ -35,13 +35,17 @@ export interface MediaAsset {
   cover?: ThumbnailCover
   /** Normalized audio peaks for the timeline waveform (sources with audio only). */
   waveform?: Waveform
+  /** Colour metadata from the probe (ffprobe names, e.g. primaries 'bt2020', transfer
+   *  'arib-std-b67' = HLG, 'smpte2084' = PQ, matrix 'bt709'). Absent = untagged / not probed,
+   *  treated as Rec. 709. Drives conversion to the project's colour space on export. */
+  color?: { primaries?: string; transfer?: string; matrix?: string; range?: string }
 }
 
 /**
  * Transition between two adjacent primary-track clips. CapCut treats every transition as an
  * overlap of the outgoing and incoming clip over a normalized 0..1 progress (catalog type 19,
  * `sdk_extra.transition = {isOverlap:true}`) — see docs/capcut-effects-reimplementation.md.
- * freecut models that overlap the same way the original crossfade did (pull the incoming clip's
+ * anycut models that overlap the same way the original crossfade did (pull the incoming clip's
  * start back by the transition duration, mirrored in both preview and the ffmpeg `xfade`
  * offset math). Each type here maps to an ffmpeg `xfade=transition=<name>` on export and to a
  * best-effort Canvas-2D approximation in the live preview.
@@ -101,8 +105,12 @@ export interface FontCatalogEntry {
   label: string
   /** CSS font-family stack for the preview canvas. */
   family: string
-  /** Absolute font file for ffmpeg drawtext on export (best-effort; macOS paths). */
+  /** Absolute font file for ffmpeg drawtext on export (best-effort; macOS paths). Empty for
+   *  fonts bundled with the app: text is baked into an overlay on export, so this is only the
+   *  drawtext fallback. */
   fontFile: string
+  /** CSS font-stretch for the canvas (wide display cuts). */
+  stretch?: string
 }
 
 export const FONT_CATALOG: FontCatalogEntry[] = [
@@ -115,7 +123,17 @@ export const FONT_CATALOG: FontCatalogEntry[] = [
   { id: 'menlo', label: 'Menlo (mono)', family: 'Menlo, Monaco, monospace', fontFile: '/System/Library/Fonts/Menlo.ttc' },
   { id: 'impact', label: 'Impact', family: 'Impact, "Arial Black", sans-serif', fontFile: '/System/Library/Fonts/Supplemental/Impact.ttf' },
   { id: 'markerfelt', label: 'Marker Felt', family: '"Marker Felt", fantasy', fontFile: '/System/Library/Fonts/Supplemental/MarkerFelt.ttc' },
-  { id: 'chalkboard', label: 'Chalkboard', family: '"Chalkboard SE", "Comic Sans MS", cursive', fontFile: '/System/Library/Fonts/Supplemental/Chalkboard.ttc' }
+  { id: 'chalkboard', label: 'Chalkboard', family: '"Chalkboard SE", "Comic Sans MS", cursive', fontFile: '/System/Library/Fonts/Supplemental/Chalkboard.ttc' },
+  // Bundled with the app (src/renderer/assets/fonts, SIL OFL / Apache). Open stand-ins for the
+  // display fonts CapCut's trending caption templates use.
+  { id: 'tiktoksans', label: 'TikTok Sans', family: '"TikTok Sans", sans-serif', fontFile: '' },
+  { id: 'montserrat', label: 'Montserrat', family: 'Montserrat, sans-serif', fontFile: '' },
+  { id: 'archivo-wide', label: 'Archivo Expanded', family: 'Archivo, sans-serif', fontFile: '', stretch: '125%' },
+  { id: 'archivo', label: 'Archivo', family: 'Archivo, sans-serif', fontFile: '' },
+  { id: 'anton', label: 'Anton', family: 'Anton, sans-serif', fontFile: '' },
+  { id: 'luckiest', label: 'Luckiest Guy', family: '"Luckiest Guy", fantasy', fontFile: '' },
+  { id: 'fredoka', label: 'Fredoka', family: 'Fredoka, sans-serif', fontFile: '' },
+  { id: 'rubik', label: 'Rubik', family: 'Rubik, sans-serif', fontFile: '' }
 ]
 
 export function fontCatalogEntry(id: string | undefined): FontCatalogEntry {
@@ -210,7 +228,7 @@ function pickTransform(k: TransformKeyframe) {
  * A single-clip, per-frame visual effect, applied in the preview (Canvas 2D) and on export
  * (an ffmpeg filter chain) — see docs/capcut-effects-reimplementation.md "Effects (applied to
  * a single clip)". CapCut's effects are AE-style layer stacks driven by cubic-bezier curves;
- * freecut reimplements the cheap ones that have faithful Canvas-2D + ffmpeg equivalents.
+ * anycut reimplements the cheap ones that have faithful Canvas-2D + ffmpeg equivalents.
  *
  * Each effect is `{ type, params }` where `params` is a flat bag of numbers in documented
  * ranges (mostly 0..1, matching CapCut's `effects_adjust_*`). The authoritative default params,
@@ -376,6 +394,24 @@ interface ClipBase {
   /** Per-clip visual effects, applied in order (preview + export). Optional/absent means none;
    *  omitted entirely from serialized projects when empty, so old `.fcproj` files round-trip. */
   effects?: ClipEffect[]
+  /** "Deactivate clip": kept on the timeline (dimmed) but skipped by preview and export. A
+   *  deactivated main-track clip leaves black in its slot so later clips keep their timing. */
+  disabled?: boolean
+  /** Clips sharing a groupId are selected, copied, cut, deleted and deactivated together. */
+  groupId?: string
+}
+
+/** A crop window as fractions of the source frame (0..1), applied before fit/scale. */
+export interface ClipCrop {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/** True when a crop is absent or covers the whole frame (nothing to do). */
+export function isFullCrop(crop: ClipCrop | undefined): boolean {
+  return !crop || (crop.x <= 1e-4 && crop.y <= 1e-4 && crop.w >= 1 - 1e-4 && crop.h >= 1 - 1e-4)
 }
 
 /** A speed value that takes effect at a given SOURCE-relative time (within [trimIn, trimOut]).
@@ -387,6 +423,42 @@ export interface SpeedKeyframe {
   speed: number
 }
 
+/** A user-facing speed-curve control point (Speed > Curve graph). `x` is the position within
+ *  the clip's trimmed source range (0 = trimIn, 1 = trimOut). These are only the editor's
+ *  handles: playback/export always read `speedKeyframes`, which the store samples from the
+ *  smooth curve through these points (see src/shared/speedCurve.ts). */
+export interface SpeedCurvePoint {
+  x: number
+  speed: number
+}
+
+/** Video > Motion blur settings (CapCut's Blur / Blend / Direction / Times). */
+export interface MotionBlurSettings {
+  /** Shutter length, 0..100 (100 = streak across one whole frame interval). */
+  blur: number
+  /** 0..100: how much of the sharp frame is mixed back over the streaks (100 = half and half). */
+  blend: number
+  direction: 'both' | 'forward' | 'backward'
+  /** The blur pass applied 1/2/4/6 times (each pass widens and softens the streak). */
+  times: 1 | 2 | 4 | 6
+}
+
+/** A baked stand-in for a media clip's source file (see MediaClip.sourceOverride). */
+export interface SourceOverride {
+  path: string
+  /** Browser-playable copy of `path` for the live preview (e.g. VP9+alpha WebM, since Chromium
+   *  can't decode ProRes 4444). Export always uses `path`. */
+  previewPath?: string
+  /** What produced it, for the UI ("Background removed"). */
+  kind: 'backgroundRemoved' | 'motionBlur'
+  /** Whether the override file carries an alpha channel (ProRes 4444 / WebM). */
+  hasAlpha: boolean
+  /** kind 'motionBlur': the settings it was baked with, plus the override it was baked ON TOP of
+   *  (e.g. a background-removed bake), which "Remove motion blur" restores. The bake is Rec. 709
+   *  SDR whatever the source was, so export must not colour-convert it again. */
+  motionBlur?: MotionBlurSettings & { base?: SourceOverride }
+}
+
 export interface MediaClip extends ClipBase {
   kind: 'media'
   assetId: string
@@ -396,7 +468,14 @@ export interface MediaClip extends ClipBase {
   muted: boolean
   speed: number // constant-speed multiplier, default 1; ignored when speedKeyframes has >=2 points
   speedKeyframes?: SpeedKeyframe[]
+  /** Speed > Curve control points the `speedKeyframes` were sampled from (absent for a flat
+   *  speed or a legacy hand-entered keyframe list). */
+  speedCurvePoints?: SpeedCurvePoint[]
+  /** Which Curve preset tile is selected ('custom' once a point is edited). */
+  speedCurvePreset?: string
   reversed: boolean // plays the (speed-adjusted) source range back to front
+  /** Edit > Crop. Absent = full frame. */
+  crop?: ClipCrop
   /** When true, speed changes also shift audio pitch (asetrate) instead of preserving it
    *  (atempo). Optional/absent ⇒ preserve pitch (the default). */
   changeAudioPitch?: boolean
@@ -408,16 +487,30 @@ export interface MediaClip extends ClipBase {
    *  swapping the timeline material's `path` to a cache output while the bin entry keeps the
    *  original. It must cover the same source timeline as the asset (frame-for-frame), so trimIn/
    *  trimOut stay valid. Absent = use the asset's file. */
-  sourceOverride?: {
-    path: string
-    /** Browser-playable copy of `path` for the live preview (e.g. VP9+alpha WebM, since Chromium
-     *  can't decode ProRes 4444). Export always uses `path`. */
-    previewPath?: string
-    /** What produced it, for the UI ("Background removed"). */
-    kind: 'backgroundRemoved'
-    /** Whether the override file carries an alpha channel (ProRes 4444 / WebM). */
-    hasAlpha: boolean
-  }
+  sourceOverride?: SourceOverride
+  /** Animation tab: In/Out (or a whole-clip Combo) motion presets. Applied on top of the static
+   *  transform by shared/animations.ts for both preview and export. */
+  animations?: ClipAnimations
+  /** Filters: one colour look (id from FILTER_CATALOG in shared/filters.ts) at an intensity
+   *  0..1. Graded on the clip's own pixels before it's fitted/placed, in preview and export. */
+  filter?: ClipFilter
+}
+
+export interface ClipFilter {
+  id: string
+  intensity: number
+}
+
+/** One applied animation preset (id from ANIMATION_CATALOG) and its length in seconds. */
+export interface ClipAnimationRef {
+  id: string
+  duration: number
+}
+/** CapCut's model: an In and/or an Out animation, or a single Combo that replaces both. */
+export interface ClipAnimations {
+  in?: ClipAnimationRef
+  out?: ClipAnimationRef
+  combo?: ClipAnimationRef
 }
 
 export interface TextClip extends ClipBase {
@@ -426,8 +519,96 @@ export interface TextClip extends ClipBase {
   fontSize: number // px, relative to a 1080-tall canvas
   color: string
   bold: boolean
+  /** Inspector "Pattern" toggles next to bold. Absent = off (old .fcproj files stay valid). */
+  italic?: boolean
+  underline?: boolean
+  /** Inspector "Case": AA / aa / Aa. Absent = text as typed. */
+  textCase?: TextCase
   /** CSS/ffmpeg font family name. Absent ⇒ default sans-serif (keeps old .fcproj files valid). */
   fontFamily?: string
+  /** Outline around the glyphs (preview strokeText, export drawtext borderw). Absent = none. */
+  stroke?: TextStroke
+  /** Present on auto-generated captions: the recognised words with CLIP-LOCAL times. Marks the
+   *  clip as a caption (so "apply to all captions" and future templates can find it) and keeps
+   *  per-word timing for word-highlight styles. */
+  caption?: { words: CaptionWord[] }
+  /** Richer styling used by caption templates (and available to any text): shadows, per-word
+   *  highlight, word-at-a-time pages, entrance animation. Absent = plain text as before. */
+  look?: TextLook
+}
+
+/** Letter case applied at render time; the typed text is kept as-is. */
+export type TextCase = 'upper' | 'lower' | 'title'
+
+/** Applies a text clip's case setting. 'title' capitalises each word and lowercases the rest. */
+export function applyTextCase(s: string, mode: TextCase | undefined): string {
+  if (mode === 'upper') return s.toUpperCase()
+  if (mode === 'lower') return s.toLowerCase()
+  if (mode === 'title') return s.toLowerCase().replace(/(^|[\s\-/(\["“]|\s['‘])(\p{L})/gu, (_, pre: string, ch: string) => pre + ch.toUpperCase())
+  return s
+}
+
+/** A drop shadow. Offsets and blur are fractions of the font size, so they scale with the text. */
+export interface TextShadow {
+  color: string
+  offsetX: number
+  offsetY: number
+  blur: number
+}
+
+/** A rounded box drawn behind text. Padding and radius are fractions of the font size. */
+export interface TextBox {
+  color: string
+  radius: number
+  padX: number
+  padY: number
+}
+
+/**
+ * Template-level text styling, modelled on what CapCut's caption templates control (see
+ * handoff "Caption templates"): words are shown a page at a time, the word being spoken can be
+ * recoloured, boxed, enlarged, and words not yet spoken can be dimmed or hidden.
+ */
+export interface TextLook {
+  /** Which caption template produced this look (for the gallery's selected state). */
+  templateId?: string
+  uppercase?: boolean
+  /** CSS font weight; overrides `bold` when set. */
+  weight?: number
+  shadows?: TextShadow[]
+  /** A box behind the whole visible page of words. */
+  pageBox?: TextBox
+  /** How the word currently being spoken is marked. */
+  highlight?: {
+    color?: string
+    box?: TextBox
+    /** The box glides from the previous word to the current one. */
+    slide?: boolean
+    /** Size multiplier for the current word. */
+    scale?: number
+  }
+  /** Opacity of words not spoken yet: 1 = shown normally, 0 = hidden (words appear as spoken). */
+  unreadOpacity?: number
+  /** Show the caption this many words at a time (0 or absent = the whole caption). */
+  wordsPerPage?: number
+  /** Break lines after this many words (CapCut's max_units_per_line), else wrap by width. */
+  wordsPerLine?: number
+  /** Entrance animation for each page. */
+  animation?: 'none' | 'pop' | 'overshoot' | 'squash'
+}
+
+export interface TextStroke {
+  color: string
+  /** Outline width in px on a 1080-tall canvas, like fontSize. */
+  width: number
+}
+
+/** One recognised word from auto-captions. Times are seconds; the frame (source, timeline or
+ *  clip-local) depends on where it's stored. */
+export interface CaptionWord {
+  text: string
+  start: number
+  end: number
 }
 
 export type Clip = MediaClip | TextClip
@@ -443,13 +624,24 @@ export interface Track {
   hidden: boolean
 }
 
+/** Project colour spaces. Rec. 709 (SDR, HD standard) is the default and the only one offered. */
+export type ColorSpaceId = 'rec709'
+
+export const COLOR_SPACES: { id: ColorSpaceId; label: string; description: string }[] = [
+  { id: 'rec709', label: 'Rec. 709 SDR', description: 'Standard HD colour. HDR footage is tone-mapped to SDR on export.' }
+]
+
+export function colorSpaceLabel(id: string | undefined): string {
+  return COLOR_SPACES.find((c) => c.id === id)?.label ?? COLOR_SPACES[0].label
+}
+
 export interface ProjectCanvas {
   width: number
   height: number
   fps: number
-  /** Working color space label (informational; export is standard Rec.709/sRGB). Optional so
-   *  old .fcproj files round-trip. */
-  colorSpace?: string
+  /** Working/output colour space. Every source is converted into it on export (HDR footage is
+   *  tone-mapped) and the file is tagged with it. Absent = 'rec709' (old .fcproj files). */
+  colorSpace?: ColorSpaceId
 }
 
 export interface Project {
@@ -464,7 +656,7 @@ export interface Project {
 
 export const FILE_EXTENSION = '.fcproj'
 
-/** Media file extensions freecut can import, by kind. The single source of truth shared by the
+/** Media file extensions anycut can import, by kind. The single source of truth shared by the
  *  main-process probe (what ffprobe is asked to read) and the renderer's import error messaging
  *  (so a rejection can say exactly which formats ARE supported). */
 export const SUPPORTED_EXTENSIONS = {
@@ -518,7 +710,10 @@ export function resolveSourceOverridesWithAudio(project: Project): { project: Pr
       if (!id) {
         id = `${c.assetId}::override::${extra.length}`
         byKey.set(key, id)
-        extra.push({ ...base, id, path: c.sourceOverride.path, previewPath: undefined })
+        // A motion-blur bake is already Rec. 709 SDR (HDR was tone-mapped while baking): drop the
+        // source's colour tags so export doesn't convert it a second time.
+        const color = c.sourceOverride.kind === 'motionBlur' ? undefined : base.color
+        extra.push({ ...base, id, path: c.sourceOverride.path, previewPath: undefined, color })
         audioAssetFor.set(id, c.assetId)
       }
       return { ...c, assetId: id }
@@ -620,6 +815,16 @@ export function effectiveDuration(clip: MediaClip): number {
  *  clip's speed curve and `reversed` flag. The single source of truth for "what source frame
  *  is playing right now" — used by live preview and conceptually mirrored by the export
  *  segment-splitting in ffmpegGraph.ts. */
+/** The source playback rate at timeline-local time `localT`: the speed of the (piecewise-constant)
+ *  speed segment playing then, or clip.speed without a curve. Direction (reversed) is not included. */
+export function clipSpeedAt(clip: MediaClip, localT: number): number {
+  const segments = clipSpeedSegments(clip)
+  if (segments.length === 1) return segments[0].speed
+  const src = sourceTimeFor(clip, localT)
+  for (const seg of segments) if (src < seg.end) return seg.speed
+  return segments[segments.length - 1].speed
+}
+
 export function sourceTimeFor(clip: MediaClip, localT: number): number {
   if (clip.frozen) return clip.trimIn
   const dur = effectiveDuration(clip)

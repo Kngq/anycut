@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
-import ffmpegPath from 'ffmpeg-static'
+import { ffmpegPath } from './binaries'
+import { colorConversionFilters, REC709_OUTPUT_ARGS } from '@shared/ffmpegGraph'
+import { probeMedia } from './probe'
 import { cacheKey, dedupe, entryPath, fileExists, stampSource, touchEntry, writeMeta } from './cache'
 
 /**
@@ -80,7 +82,8 @@ async function buildProxy(
           filePath,
           // Downscale to 720p (never upscale), keep aspect, even dimensions.
           '-vf',
-          `scale=-2:'min(${PROXY_HEIGHT},ih)'`,
+          // HDR sources are tone-mapped like export, so the proxy (an 8-bit SDR file) isn't washed out.
+          `scale=-2:'min(${PROXY_HEIGHT},ih)',${colorConversionFilters((await probeMedia(filePath))?.color)}null`,
           '-c:v',
           'libx264',
           '-preset',
@@ -89,6 +92,7 @@ async function buildProxy(
           '23',
           '-pix_fmt',
           'yuv420p',
+          ...REC709_OUTPUT_ARGS,
           '-c:a',
           'aac',
           '-movflags',
@@ -107,7 +111,7 @@ async function buildProxy(
       const tKey = cacheKey('proxies', src)
       return dedupe(`proxies:${tKey}`, () => buildProxy(filePath, 'transcode', 'proxies', tKey, src))
     }
-    console.error('[freecut] preview proxy generation failed for', filePath, err)
+    console.error('[anycut] preview proxy generation failed for', filePath, err)
     return null
   }
 }

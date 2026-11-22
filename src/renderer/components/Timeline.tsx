@@ -1,10 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useProjectStore } from '../state/projectStore'
+import Slider from './Slider'
+import { selectionOf, useProjectStore } from '../state/projectStore'
+import ClipContextMenu from './ClipContextMenu'
 import { useLayoutStore, TRACK_HEIGHTS, type TrackHeightMode } from '../state/layoutStore'
 import { effectCatalogEntry, formatMMSS, projectDuration, TRANSITION_CATALOG, type Clip, type MediaAsset, type ThumbnailCover, type Track } from '@shared/types'
+import { displayTracks } from '@shared/trackOrder'
 import { resolveDrop, type DragPayload, type DropResolution } from '@shared/dropTargets'
+import { clipDrawInsets, resizedTransitionDuration, transitionBlocks, type TransitionBlock } from '@shared/transitionBlocks'
+import { resolveMediaDrop, trackForAsset as trackForAssetIn, type MediaDropGhost } from '@shared/mediaDrop'
 import { ASSET_DRAG_MIME, assetsFromPaths, droppedFilePaths, isMediaDrag } from '../media'
-import { activeDragPayload, endFxDrag, isFxDrag, readFxPayload } from '../dragPayload'
+import { activeAssetDragId, activeDragPayload, endAssetDrag, endFxDrag, isFxDrag, readFxPayload } from '../dragPayload'
 import { useToastStore } from '../state/toastStore'
 
 /** Width of the sticky track label column; lanes and the ruler's 0s mark start after it. */
@@ -32,6 +37,22 @@ interface FxDropState {
   resolution: DropResolution
   /** Pointer x within the lane (px), for placing the reject chip. */
   laneX: number
+}
+
+/** Live hover state of a media-bin asset drag: CapCut's "follow segment" ghost. */
+interface MediaGhostState extends MediaDropGhost {
+  name: string
+  kind: 'video' | 'audio'
+}
+
+/** Pointer distance (px) from the timeline's visible edge that starts auto-scrolling during a
+ *  drag (CapCut's `autoScrollMargin: 20`), and how far each dragover tick scrolls. */
+const DRAG_SCROLL_MARGIN = 20
+const DRAG_SCROLL_STEP = 14
+
+function sameGhost(a: MediaGhostState | null, b: MediaGhostState | null): boolean {
+  if (!a || !b) return a === b
+  return a.trackId === b.trackId && a.start === b.start && a.snapTime === b.snapTime && a.snapKind === b.snapKind && a.name === b.name
 }
 
 function payloadLabel(payload: DragPayload): string {
@@ -285,11 +306,21 @@ function sameFxDrop(a: FxDropState, b: FxDropState): boolean {
   return ra.kind === 'reject' && rb.kind === 'reject' && ra.reason === rb.reason && Math.abs(a.laneX - b.laneX) < 4
 }
 
+/** Height of a text/caption track row (CapCut keeps these compact). */
+const TEXT_ROW_HEIGHT = 36
+
 export default function Timeline() {
   const project = useProjectStore((s) => s.project)
   const pxPerSecond = useProjectStore((s) => s.pxPerSecond)
   const playhead = useProjectStore((s) => s.playhead)
   const selectedClipId = useProjectStore((s) => s.selectedClipId)
+  const selectedClipIds = useProjectStore((s) => s.selectedClipIds)
+  const toggleClipSelection = useProjectStore((s) => s.toggleClipSelection)
+  const deleteSelection = useProjectStore((s) => s.deleteSelection)
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; clipId: string | null } | null>(null)
+  // CapCut row order: text/captions above the video, audio below.
+  const rowTracks = useMemo(() => displayTracks(project), [project])
+  const selectedIds = useMemo(() => selectionOf({ project, selectedClipId, selectedClipIds }), [project, selectedClipId, selectedClipIds])
   const missingAssetIds = useProjectStore((s) => s.missingAssetIds)
   const setPlayhead = useProjectStore((s) => s.setPlayhead)
   const selectClip = useProjectStore((s) => s.selectClip)
@@ -330,13 +361,22 @@ export default function Timeline() {
   const [trim, setTrim] = useState<TrimState | null>(null)
   const [dropTrackId, setDropTrackId] = useState<string | null>(null)
   const [fxDrop, setFxDrop] = useState<FxDropState | null>(null)
+  const [mediaGhost, setMediaGhost] = useState<MediaGhostState | null>(null)
+  /** A transition block being resized by its edge handle (committed on release). */
+  const [transResize, setTransResize] = useState<{ clipId: string; duration: number } | null>(null)
+  /** Which transition block is highlighted (keyed by its owning clip). Clicking a block selects
+   *  that clip too, so the Inspector shows the transition's settings. */
+  const [selectedTransition, setSelectedTransition] = useState<string | null>(null)
 
   // An effect/transition drag can end anywhere (released over the bin, Esc, dropped outside the
   // window); clear the ghost and the recorded payload whenever any drag finishes.
   useEffect(() => {
     const clear = () => {
       setFxDrop(null)
+      setMediaGhost(null)
+      setDropTrackId(null)
       endFxDrag()
+      endAssetDrag()
     }
     window.addEventListener('dragend', clear)
     window.addEventListener('drop', clear)
@@ -398,8 +438,33 @@ export default function Timeline() {
 
   /** The track a dropped asset should land on: the hovered one if its type fits, else the first that does. */
   function trackForAsset(asset: MediaAsset, hovered: Track): Track | undefined {
-    const wanted = asset.kind === 'audio' ? 'audio' : 'video'
-    return hovered.type === wanted ? hovered : project.tracks.find((t) => t.type === wanted)
+    return trackForAssetIn(project, asset, hovered.id)
+  }
+
+  /** Scrolls the timeline while a drag hovers near its visible edge. dragover keeps firing while
+   *  the pointer is still, so each event is one scroll tick (CapCut runs a timer instead). */
+  function autoScrollDuringDrag(e: React.DragEvent) {
+    const el = wrapRef.current
+    if (!el) return
+    const r = el.getBoundingClientRect()
+    if (e.clientX > r.right - DRAG_SCROLL_MARGIN) el.scrollLeft += DRAG_SCROLL_STEP
+    else if (e.clientX < r.left + LABEL_WIDTH + DRAG_SCROLL_MARGIN) el.scrollLeft -= DRAG_SCROLL_STEP
+    if (e.clientY > r.bottom - DRAG_SCROLL_MARGIN) el.scrollTop += DRAG_SCROLL_STEP
+    else if (e.clientY < r.top + DRAG_SCROLL_MARGIN) el.scrollTop -= DRAG_SCROLL_STEP
+  }
+
+  /** Hover AND drop placement for a media-bin asset (one resolver, so the ghost is the result).
+   *  Holding ⌘/Ctrl turns snapping off, as in CapCut. */
+  function resolveAssetAt(e: React.DragEvent, track: Track, asset: MediaAsset): MediaGhostState | null {
+    const state = useProjectStore.getState()
+    const ghost = resolveMediaDrop(state.project, asset, {
+      trackId: track.id,
+      time: timeAt(e.clientX),
+      pxPerSecond,
+      playhead: state.playhead,
+      snap: !(e.metaKey || e.ctrlKey)
+    })
+    return ghost && { ...ghost, name: asset.name, kind: asset.kind === 'audio' ? 'audio' : 'video' }
   }
 
   /** One decision point for hover AND drop (CapCut's model): the same resolver result drives
@@ -425,8 +490,26 @@ export default function Timeline() {
   }
 
   function onLaneDragOver(e: React.DragEvent, track: Track) {
+    if (isFxDrag(e.dataTransfer) || isMediaDrag(e.dataTransfer)) autoScrollDuringDrag(e)
     if (isFxDrag(e.dataTransfer)) return onFxDragOver(e, track)
     if (!isMediaDrag(e.dataTransfer)) return
+    const assetId = activeAssetDragId()
+    const asset = assetId ? useProjectStore.getState().project.assets.find((a) => a.id === assetId) : undefined
+    if (asset) {
+      // Bin asset: CapCut's follow ghost, at the snapped spot it will land on.
+      const next = resolveAssetAt(e, track, asset)
+      if (!next) {
+        e.dataTransfer.dropEffect = 'none'
+        setMediaGhost(null)
+        return
+      }
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'copy'
+      setMediaGhost((prev) => (sameGhost(prev, next) ? prev : next))
+      return
+    }
+    // Files from Finder: durations are unknown until import, so there's no ghost. CapCut doesn't
+    // draw one either. Highlight the lane instead.
     e.preventDefault() // required, or the browser refuses the drop
     e.dataTransfer.dropEffect = 'copy'
     if (dropTrackId !== track.id) setDropTrackId(track.id)
@@ -436,6 +519,7 @@ export default function Timeline() {
     if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
       setDropTrackId(null)
       setFxDrop(null)
+      setMediaGhost(null)
     }
   }
 
@@ -465,10 +549,20 @@ export default function Timeline() {
     if (!isMediaDrag(e.dataTransfer)) return
     e.preventDefault()
     setDropTrackId(null)
+    setMediaGhost(null)
     // DataTransfer is only readable during the event, so read everything before awaiting.
     const dropTime = timeAt(e.clientX)
     const assetId = e.dataTransfer.getData(ASSET_DRAG_MIME)
     const paths = assetId ? [] : droppedFilePaths(e.dataTransfer)
+
+    // A single bin asset commits exactly where its ghost was drawn (same resolver).
+    if (assetId) {
+      endAssetDrag()
+      const asset = useProjectStore.getState().project.assets.find((a) => a.id === assetId)
+      const ghost = asset && resolveAssetAt(e, track, asset)
+      if (asset && ghost) addMediaClipToTrack(ghost.trackId, asset, ghost.start, { insertAtStart: true })
+      return
+    }
 
     let assets: MediaAsset[]
     if (assetId) {
@@ -510,8 +604,19 @@ export default function Timeline() {
 
   function onClipPointerDown(e: React.MouseEvent, clip: Clip, track: Track) {
     e.stopPropagation()
+    // Right button: keep a multi-selection the clip belongs to (the context menu acts on it).
+    if (e.button === 2) {
+      if (!selectedIds.includes(clip.id)) selectClip(clip.id)
+      return
+    }
+    // Cmd/Ctrl/Shift-click adds to (or removes from) the selection, no drag.
+    if (e.metaKey || e.ctrlKey || e.shiftKey) {
+      toggleClipSelection(clip.id)
+      return
+    }
     selectClip(clip.id)
-    const rows = project.tracks.map((t) => {
+    setSelectedTransition(null)
+    const rows = rowTracks.map((t) => {
       const el = trackRowRefs.current.get(t.id)
       const rect = el?.getBoundingClientRect()
       return rect ? rect.top + rect.height / 2 : 0
@@ -524,7 +629,7 @@ export default function Timeline() {
       clipStartPx: clip.start * pxPerSecond,
       dx: 0,
       trackRowY: rows,
-      trackRowIds: project.tracks.map((t) => t.id)
+      trackRowIds: rowTracks.map((t) => t.id)
     }
     dragRef.current = initial
     setDrag(initial)
@@ -626,10 +731,67 @@ export default function Timeline() {
     )
   }
 
-  function renderClip(clip: Clip, track: Track) {
+  /** CapCut-style transition block over a cut: a translucent grey segment centred on the cut,
+   *  icon in the middle, edge handles that stretch it symmetrically (longer = slower). */
+  function renderTransitionBlock(block: TransitionBlock) {
+    const live = transResize?.clipId === block.clipId ? transResize.duration : block.duration
+    const width = live * pxPerSecond
+    const left = (block.mid - live / 2) * pxPerSecond
+    const label = TRANSITION_CATALOG.find((t) => t.type === block.type)?.label ?? block.type
+    const selected = selectedClipId === block.clipId && selectedTransition === block.clipId
+
+    function onHandleDown(e: React.MouseEvent) {
+      e.stopPropagation()
+      e.preventDefault()
+      selectClip(block.clipId)
+      setSelectedTransition(block.clipId)
+      let latest = block.duration
+      setTransResize({ clipId: block.clipId, duration: latest })
+      function onMove(ev: MouseEvent) {
+        latest = resizedTransitionDuration(block, timeAt(ev.clientX))
+        setTransResize({ clipId: block.clipId, duration: latest })
+      }
+      function onUp() {
+        window.removeEventListener('mousemove', onMove)
+        window.removeEventListener('mouseup', onUp)
+        setTransResize(null)
+        // One undo step for the whole gesture.
+        if (Math.abs(latest - block.duration) > 1e-3) setClipTransition(block.clipId, { type: block.type, duration: latest })
+      }
+      window.addEventListener('mousemove', onMove)
+      window.addEventListener('mouseup', onUp)
+    }
+
+    return (
+      <div
+        key={`tr-${block.clipId}`}
+        className={`transition-block ${selected ? 'selected' : ''} ${transResize?.clipId === block.clipId ? 'resizing' : ''}`}
+        style={{ left, width: Math.max(width, 4) }}
+        title={`${label} · ${live.toFixed(2)}s. Drag an edge to make it faster or slower.`}
+        onMouseDown={(e) => {
+          e.stopPropagation()
+          selectClip(block.clipId)
+          setSelectedTransition(block.clipId)
+        }}
+      >
+        {width >= 20 && (
+          <svg className="transition-block-icon" viewBox="0 0 18 18" width="18" height="18" aria-hidden>
+            <path d="M3 6.5h10.5L11 4M15 11.5H4.5L7 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        )}
+        <div className="transition-handle left" onMouseDown={onHandleDown} />
+        <div className="transition-handle right" onMouseDown={onHandleDown} />
+        {transResize?.clipId === block.clipId && <span className="transition-readout">{live.toFixed(1)}s</span>}
+      </div>
+    )
+  }
+
+  function renderClip(clip: Clip, track: Track, inset: { left: number; right: number } = { left: 0, right: 0 }) {
     const isDraggingThis = drag?.clipId === clip.id
-    const left = isDraggingThis ? drag.clipStartPx + drag.dx : clip.start * pxPerSecond
-    const width = Math.max(clip.duration * pxPerSecond, 4)
+    // Clips next to a transition are drawn shortened by half of it, so they meet at the cut and
+    // the transition block sits over the join (CapCut's look). Time positions are unchanged.
+    const left = (isDraggingThis ? drag.clipStartPx + drag.dx : clip.start * pxPerSecond) + inset.left * pxPerSecond
+    const width = Math.max((clip.duration - inset.left - inset.right) * pxPerSecond, 4)
 
     const asset = clip.kind === 'media' ? project.assets.find((a) => a.id === clip.assetId) : undefined
     const offline = clip.kind === 'media' && missingAssetIds.includes(clip.assetId)
@@ -643,6 +805,14 @@ export default function Timeline() {
     if (clip.kind === 'media' && asset && asset.duration > 0) {
       startFrac = Math.min(1, Math.max(0, clip.trimIn / asset.duration))
       endFrac = Math.min(1, Math.max(startFrac + 1e-4, clip.trimOut / asset.duration))
+      // Crop the decorations to the drawn (inset) part of the clip.
+      if (clip.duration > 0 && (inset.left > 0 || inset.right > 0)) {
+        const span = endFrac - startFrac
+        const s0 = startFrac + (span * inset.left) / clip.duration
+        const e0 = endFrac - (span * inset.right) / clip.duration
+        startFrac = s0
+        endFrac = Math.max(s0 + 1e-4, e0)
+      }
     }
 
     // A filmstrip of distinct frames sliced from the asset's sprite sheet, tiled edge-to-edge
@@ -664,9 +834,14 @@ export default function Timeline() {
     return (
       <div
         key={clip.id}
-        className={`clip ${clipClassName(clip, track)} ${hasCover ? 'has-cover' : ''} ${selectedClipId === clip.id ? 'selected' : ''} ${offline ? 'offline' : ''} ${fxDrop?.resolution.kind === 'attach' && fxDrop.resolution.clipId === clip.id ? 'drop-attach' : ''}`}
+        className={`clip ${clipClassName(clip, track)} ${hasCover ? 'has-cover' : ''} ${selectedIds.includes(clip.id) ? 'selected' : ''} ${clip.disabled ? 'disabled' : ''} ${offline ? 'offline' : ''} ${fxDrop?.resolution.kind === 'attach' && fxDrop.resolution.clipId === clip.id ? 'drop-attach' : ''}`}
         style={{ left, width, zIndex: isDraggingThis ? 10 : 1 }}
         onMouseDown={(e) => onClipPointerDown(e, clip, track)}
+        onContextMenu={(e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          setCtxMenu({ x: e.clientX, y: e.clientY, clipId: clip.id })
+        }}
         title={clip.kind === 'text' ? clip.text : `${name} · ${clip.duration.toFixed(1)}s`}
       >
         {hasCover && anyVisible && (
@@ -680,9 +855,17 @@ export default function Timeline() {
             visibleEnd={visibleEnd}
           />
         )}
-        <div className="clip-header">
-          {clip.transitionIn && track.type === 'video' && <span className="clip-transition-badge">⤬</span>}
+        <div
+          className="clip-header"
+          // Keep the title clear of a transition block covering this clip's head.
+          style={inset.left > 0 ? { paddingLeft: inset.left * pxPerSecond + 6 } : undefined}
+        >
           {offline && <span className="clip-offline-tag">Offline</span>}
+          {clip.groupId && (
+            <svg className="clip-group-mark" width="11" height="11" viewBox="0 0 24 24" aria-label="Grouped">
+              <path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" />
+            </svg>
+          )}
           {clip.kind === 'media' && clip.effects && clip.effects.length > 0 && renderEffectBadge(clip)}
           <span className="clip-title">{headerLabel}</span>
         </div>
@@ -730,13 +913,14 @@ export default function Timeline() {
 
   return (
     <div className="timeline-wrap" ref={wrapRef}>
+      {ctxMenu && <ClipContextMenu x={ctxMenu.x} y={ctxMenu.y} clipId={ctxMenu.clipId} onClose={() => setCtxMenu(null)} />}
       <div className="timeline-toolbar">
         <div className="tl-tools">
           <ToolButton icon={IconUndo} label="Undo" shortcut="⌘Z" disabled={!canUndo} onClick={undo} />
           <ToolButton icon={IconRedo} label="Redo" shortcut="⌘⇧Z" disabled={!canRedo} onClick={redo} />
           <span className="tl-sep" />
           <ToolButton icon={IconSplit} label="Split" shortcut="⌘B" disabled={!selectedClipId} onClick={splitClipAtPlayhead} />
-          <ToolButton icon={IconDelete} label="Delete" shortcut="⌫" disabled={!selectedClipId} onClick={() => selectedClipId && removeClip(selectedClipId)} />
+          <ToolButton icon={IconDelete} label="Delete" shortcut="⌫" disabled={!selectedClipId} onClick={deleteSelection} />
           <span className="tl-sep" />
           <ToolButton icon={IconMirror} label="Mirror" shortcut="⌘M" disabled={!selectedClipId} onClick={() => selectedClipId && toggleClipFlipH(selectedClipId)} />
           <ToolButton icon={IconRotate} label="Flip" shortcut="⌘⇧F" disabled={!selectedClipId} onClick={() => selectedClipId && rotateClip(selectedClipId, 90)} />
@@ -746,14 +930,7 @@ export default function Timeline() {
         </div>
         <span className="tl-spacer" />
         <span style={{ color: 'var(--text-dim)' }}>Zoom</span>
-        <input
-          type="range"
-          min={minPxPerSecond}
-          max={maxPxPerSecond}
-          step="any"
-          value={pxPerSecond}
-          onChange={(e) => setZoom(Math.max(minPxPerSecond, Number(e.target.value)))}
-        />
+        <Slider className="tl-zoom" min={minPxPerSecond} max={maxPxPerSecond} value={pxPerSecond} onChange={(v) => setZoom(Math.max(minPxPerSecond, v))} />
         <span className="tl-sep" />
         <div className="tl-rowheight" title="Track row height">
           {(['short', 'default', 'tall'] as TrackHeightMode[]).map((mode) => (
@@ -780,11 +957,12 @@ export default function Timeline() {
             </div>
           ))}
         </div>
-        {project.tracks.map((track) => (
+        {rowTracks.map((track) => (
           <div
             className={`track-row th-${trackHeightMode} ${dropTrackId === track.id ? 'drop-active' : ''} ${fxDrop?.trackId === track.id && fxDrop.resolution.kind === 'reject' ? 'drop-reject' : ''}`}
             key={track.id}
-            style={{ height: rowHeight }}
+            // Text/caption rows are thin strips like CapCut's; media rows use the density setting.
+            style={{ height: track.type === 'text' ? Math.min(rowHeight, TEXT_ROW_HEIGHT) : rowHeight }}
             onDragOver={(e) => onLaneDragOver(e, track)}
             onDragLeave={onLaneDragLeave}
             onDrop={(e) => void onLaneDrop(e, track)}
@@ -796,14 +974,43 @@ export default function Timeline() {
                 if (el) trackRowRefs.current.set(track.id, el)
               }}
               style={{ width: totalWidth - LABEL_WIDTH }}
-              onMouseDown={() => selectClip(null)}
+              onMouseDown={(e) => e.button !== 2 && selectClip(null)}
+              onContextMenu={(e) => {
+                e.preventDefault()
+                setCtxMenu({ x: e.clientX, y: e.clientY, clipId: null })
+              }}
             >
-              {track.clips.map((clip) => renderClip(clip, track))}
-              {fxDrop?.trackId === track.id && fxDrop.resolution.kind === 'transition' && (
-                <div className="cut-drop-marker" style={{ left: fxDrop.resolution.cutTime * pxPerSecond }}>
-                  <span className="cut-drop-chip">
-                    {payloadLabel(fxDrop.payload)} · {fxDrop.resolution.duration.toFixed(1)}s
-                  </span>
+              {(() => {
+                const insets = clipDrawInsets(track)
+                return track.clips.map((clip) => renderClip(clip, track, insets.get(clip.id)))
+              })()}
+              {transitionBlocks(track).map(renderTransitionBlock)}
+              {fxDrop?.trackId === track.id && fxDrop.resolution.kind === 'transition' && (() => {
+                // CapCut's transition follow item: a rounded block as long as the transition,
+                // centred on the cut, with a 16×12 icon shown only when it fits.
+                const width = Math.max(fxDrop.resolution.duration * pxPerSecond, 6)
+                return (
+                  <div className="cut-drop-marker" style={{ left: fxDrop.resolution.cutTime * pxPerSecond - width / 2, width }}>
+                    {width >= 16 && (
+                      <svg className="cut-drop-icon" viewBox="0 0 16 12" width="16" height="12" aria-hidden>
+                        <path d="M1 3h10l-3-2.5M15 9H5l3 2.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    )}
+                    <span className="cut-drop-chip">
+                      {payloadLabel(fxDrop.payload)} · {fxDrop.resolution.duration.toFixed(1)}s
+                    </span>
+                  </div>
+                )
+              })()}
+              {mediaGhost?.trackId === track.id && (
+                <div
+                  className={`drop-ghost ${mediaGhost.kind}`}
+                  style={{ left: mediaGhost.start * pxPerSecond, width: Math.max(mediaGhost.duration * pxPerSecond, 4) }}
+                >
+                  <div className="drop-ghost-chips">
+                    <span className="drop-ghost-chip">{mediaGhost.name}</span>
+                    <span className="drop-ghost-chip">{formatTimecode(mediaGhost.duration)}</span>
+                  </div>
                 </div>
               )}
               {fxDrop?.trackId === track.id && fxDrop.resolution.kind === 'reject' && (
@@ -814,7 +1021,10 @@ export default function Timeline() {
             </div>
           </div>
         ))}
-        <div className="playhead" style={{ left: LABEL_WIDTH + playhead * pxPerSecond }}>
+        {mediaGhost?.snapTime != null && mediaGhost.snapKind !== 'playhead' && (
+          <div className="drop-snap-line" style={{ left: LABEL_WIDTH + mediaGhost.snapTime * pxPerSecond }} />
+        )}
+        <div className={`playhead ${mediaGhost?.snapKind === 'playhead' ? 'snapped' : ''}`} style={{ left: LABEL_WIDTH + playhead * pxPerSecond }}>
           <div className="playhead-handle" />
         </div>
       </div>

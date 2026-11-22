@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// REPL driver for freecut, for agents (and humans) to drive the live Electron app without a
+// REPL driver for anycut, for agents (and humans) to drive the live Electron app without a
 // real display session. Launches the Vite dev server (if not already up) plus a debug-enabled
 // Electron instance, connects over the Chrome DevTools Protocol, and exposes commands over
 // stdin. Screenshots go through CDP's own Page.captureScreenshot — NOT the OS `screencapture`
@@ -12,7 +12,7 @@
 // Gotcha this driver exists because of: in dev mode the renderer loads from
 // http://localhost:5173, not file://. <video>/<audio> elements loading a plain file:// src
 // from that origin get rejected by Chromium's media URL safety check. The app works around
-// this with a custom `freecut-media://` protocol registered in electron/main/index.ts — if
+// this with a custom `anycut-media://` protocol registered in electron/main/index.ts — if
 // you're debugging "nothing plays", that protocol registration is the first thing to check,
 // not the player code.
 
@@ -23,8 +23,8 @@ import * as readline from 'node:readline'
 
 const ROOT = path.resolve(import.meta.dirname, '..')
 const SHOT_DIR = process.env.SCREENSHOT_DIR || path.join(ROOT, '.dev-shots')
-const DEBUG_PORT = Number(process.env.FREECUT_DEBUG_PORT || 9222)
-const VITE_URL = process.env.FREECUT_VITE_URL || 'http://localhost:5173'
+const DEBUG_PORT = Number(process.env.ANYCUT_DEBUG_PORT || 9222)
+const VITE_URL = process.env.ANYCUT_VITE_URL || 'http://localhost:5173'
 fs.mkdirSync(SHOT_DIR, { recursive: true })
 
 const electronBin = path.join(ROOT, 'node_modules/electron/dist/Electron.app/Contents/MacOS/Electron')
@@ -202,5 +202,5 @@ rl.on('close', async () => {
   process.exit(0)
 })
 
-console.log('freecut dev driver — "help" for commands, "launch" to start')
+console.log('anycut dev driver — "help" for commands, "launch" to start')
 rl.prompt()

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useProjectStore } from '../state/projectStore'
 import { useRecentsStore } from '../state/recentsStore'
 import { loadOpenedProject } from '../projectIO'
+import logoUrl from '../assets/logo.png'
 
 function formatRelativeTime(ts: number): string {
   const minutes = Math.round((Date.now() - ts) / 60000)
@@ -46,7 +47,10 @@ export default function Home({ onEnterEditor }: { onEnterEditor: () => void }) {
   return (
     <div className="home">
       <aside className="home-sidebar">
-        <div className="home-logo">freecut</div>
+        <div className="home-logo">
+          <img src={logoUrl} alt="" width={26} height={26} />
+          anycut
+        </div>
         <nav className="home-nav">
           <div className="home-nav-item active">
             <span className="home-nav-icon">⌂</span>

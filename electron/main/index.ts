@@ -7,15 +7,34 @@ import { probeMedia } from './probe'
 import { ensurePreviewProxy } from './proxy'
 import { ensureVideoCover } from './thumbnails'
 import { ensureWaveform } from './waveform'
-import { captionStatus, downloadCaptionModel, transcribeToCaptions } from './transcribe'
+import { cancelCaptions, captionStatus, stopCaptionWorker, transcribeSources } from './captions'
+import type { CaptionSource } from '@shared/captions'
 import { backgroundStatus, downloadBackgroundModel, removeBackground } from './background'
+import { cancelMotionBlur, motionBlur } from './motionBlur'
+import type { MotionBlurSettings } from '@shared/types'
+import type { MattingModelId } from '@shared/ipc'
 import { cacheRoot, cacheUsage, cleanCache, protectedSourcesFor } from './cache'
 import { autoRelink, findMissing } from './relink'
-import { exportProject } from './export'
+import { exportProject, extractAudio } from './export'
+import { overlayBegin, overlayBlank, overlayDiscard, overlayFrame, overlayPattern } from './textOverlay'
 import { handleMediaRequest } from './mediaProtocol'
 import { FILE_EXTENSION, type Project } from '@shared/types'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// anycut was called freecut: move the old data folder (media cache, settings, recent projects)
+// over to the new app name on first launch. Runs before anything touches userData.
+{
+  const oldDir = path.join(app.getPath('appData'), 'freecut-editor')
+  const newDir = app.getPath('userData')
+  if (newDir !== oldDir && fsSync.existsSync(oldDir) && !fsSync.existsSync(newDir)) {
+    try {
+      fsSync.renameSync(oldDir, newDir)
+    } catch (err) {
+      console.warn('[anycut] could not migrate the freecut data folder', err)
+    }
+  }
+}
 
 const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL
 
@@ -26,7 +45,7 @@ const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL
  * handleMediaRequest, which reads the file with Node fs directly — see that file for why not
  * net.fetch) works from both the dev server origin and the packaged file:// origin.
  */
-const MEDIA_SCHEME = 'freecut-media'
+const MEDIA_SCHEME = 'anycut-media'
 
 protocol.registerSchemesAsPrivileged([
   { scheme: MEDIA_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } }
@@ -34,10 +53,17 @@ protocol.registerSchemesAsPrivileged([
 
 let win: BrowserWindow | null = null
 
+// In development the window must never steal focus from whatever the developer (or an agent's
+// user) is working in: it is created hidden and shown inactive. Packaged builds behave normally.
+// ANYCUT_SHOW_INACTIVE=1 gives a packaged build the same treatment, for agents smoke-testing a
+// release build while the user keeps working.
+const IS_DEV = !app.isPackaged || process.env.ANYCUT_SHOW_INACTIVE === '1'
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1440,
     height: 900,
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.mjs'),
       contextIsolation: true,
@@ -47,6 +73,11 @@ function createWindow() {
 
   // A file dropped outside a drop zone would otherwise replace the editor with that file.
   win.webContents.on('will-navigate', (e) => e.preventDefault())
+
+  win.once('ready-to-show', () => {
+    if (IS_DEV) win?.showInactive()
+    else win?.show()
+  })
 
   if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL)
@@ -80,6 +111,22 @@ ipcMain.handle('media:openDialog', async () => {
   })
   return result.canceled ? [] : result.filePaths
 })
+
+/** Reveals a media file in Finder ("Open file location"). */
+ipcMain.handle('media:showInFolder', async (_e, filePath: string) => {
+  shell.showItemInFolder(filePath)
+})
+
+/** A fresh path for a rendered compound clip. These are user media (the timeline points at them),
+ *  so they live beside the app's data, not in the auto-cleaned cache. */
+ipcMain.handle('media:compoundPath', async () => {
+  const dir = path.join(app.getPath('userData'), 'Compound clips')
+  await fs.mkdir(dir, { recursive: true })
+  return path.join(dir, `compound-${new Date().toISOString().replace(/[:.]/g, '-')}.mp4`)
+})
+
+/** "Extract audio": the file's audio track as a standalone .m4a, for the media bin. */
+ipcMain.handle('media:extractAudio', async (_e, filePath: string) => extractAudio(filePath))
 
 ipcMain.handle('media:probe', async (_e, filePath: string) => {
   return probeMedia(filePath)
@@ -119,31 +166,43 @@ ipcMain.handle('caption:status', async () => {
   return captionStatus()
 })
 
-ipcMain.handle('caption:download', async () => {
-  return downloadCaptionModel()
+ipcMain.handle('caption:transcribe', async (e, sources: CaptionSource[], language: string) => {
+  return transcribeSources(sources, language, (p) => {
+    if (!e.sender.isDestroyed()) e.sender.send('caption:progress', p)
+  })
 })
 
-ipcMain.handle('caption:transcribe', async (_e, filePath: string) => {
-  return transcribeToCaptions(filePath)
+ipcMain.handle('caption:cancel', async () => {
+  cancelCaptions()
 })
+
+app.on('will-quit', () => stopCaptionWorker())
 
 ipcMain.handle('background:status', async () => {
   return backgroundStatus()
 })
 
-ipcMain.handle('background:download', async () => {
-  return downloadBackgroundModel()
+ipcMain.handle('background:download', async (_e, model: MattingModelId) => {
+  return downloadBackgroundModel(model, (ratio) => win?.webContents.send('background:progress', ratio))
 })
 
-ipcMain.handle('background:remove', async (_e, filePath: string) => {
-  return removeBackground(filePath, (ratio) => win?.webContents.send('background:progress', ratio))
+ipcMain.handle('background:remove', async (_e, filePath: string, model: MattingModelId) => {
+  return removeBackground(filePath, model, (ratio) => win?.webContents.send('background:progress', ratio))
+})
+
+ipcMain.handle('motionBlur:run', async (_e, filePath: string, settings: MotionBlurSettings) => {
+  return motionBlur(filePath, settings, (ratio) => win?.webContents.send('motionBlur:progress', ratio))
+})
+
+ipcMain.handle('motionBlur:cancel', async () => {
+  cancelMotionBlur()
 })
 
 ipcMain.handle('project:saveDialog', async (_e, defaultName: string) => {
   if (!win) return null
   const result = await dialog.showSaveDialog(win, {
     defaultPath: defaultName.endsWith(FILE_EXTENSION) ? defaultName : `${defaultName}${FILE_EXTENSION}`,
-    filters: [{ name: 'freecut project', extensions: ['fcproj'] }]
+    filters: [{ name: 'anycut project', extensions: ['fcproj'] }]
   })
   return result.canceled || !result.filePath ? null : result.filePath
 })
@@ -169,7 +228,7 @@ async function readProjectFile(filePath: string): Promise<{ path: string; projec
 }
 
 /* ── Project lock (CapCut's `.locked`) ─────────────────────────────────────────────
-   `<project>.lock` holds the PID of the freecut process that has the project open. Opening a
+   `<project>.lock` holds the PID of the anycut process that has the project open. Opening a
    project that's locked by a DIFFERENT live process reports that PID so the UI can warn (two
    windows saving the same file would clobber each other). Advisory, never blocking: a lock left by
    a crashed process has a dead PID and is silently taken over. */
@@ -261,7 +320,7 @@ ipcMain.handle('project:openDialog', async () => {
   if (!win) return null
   const result = await dialog.showOpenDialog(win, {
     properties: ['openFile'],
-    filters: [{ name: 'freecut project', extensions: ['fcproj'] }]
+    filters: [{ name: 'anycut project', extensions: ['fcproj'] }]
   })
   if (result.canceled || result.filePaths.length === 0) return null
   return readProjectFile(result.filePaths[0])
@@ -295,8 +354,25 @@ ipcMain.handle('export:dialog', async (_e, defaultName: string) => {
   return result.canceled || !result.filePath ? null : result.filePath
 })
 
-ipcMain.handle('export:run', async (_e, project: Project, outputPath: string) => {
-  return exportProject(project, outputPath, (progress) => {
-    win?.webContents.send('export:progress', progress)
-  })
+ipcMain.handle('export:run', async (_e, project: Project, outputPath: string, overlayId?: string, range?: { start: number; end: number }) => {
+  const pattern = overlayId ? overlayPattern(overlayId) : null
+  try {
+    return await exportProject(
+      project,
+      outputPath,
+      (progress) => {
+        win?.webContents.send('export:progress', progress)
+      },
+      pattern ? { pattern, fps: project.canvas.fps } : undefined,
+      range
+    )
+  } finally {
+    if (overlayId) void overlayDiscard(overlayId)
+  }
 })
+
+// Text overlay bake (renderer draws captions/text frames; see textOverlay.ts).
+ipcMain.handle('overlay:begin', async () => overlayBegin())
+ipcMain.handle('overlay:blank', async (_e, id: string, data: Uint8Array) => overlayBlank(id, data))
+ipcMain.handle('overlay:frame', async (_e, id: string, index: number, data: Uint8Array | 'blank' | 'same') => overlayFrame(id, index, data))
+ipcMain.handle('overlay:discard', async (_e, id: string) => overlayDiscard(id))

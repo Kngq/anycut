@@ -7,7 +7,11 @@ import Inspector from './components/Inspector'
 import Home from './components/Home'
 import ResizeHandle from './components/ResizeHandle'
 import Toasts from './components/Toasts'
-import { useProjectStore } from './state/projectStore'
+import CropDialog from './components/CropDialog'
+import { createCompoundClip } from './clipActions'
+import { selectionOf, useProjectStore } from './state/projectStore'
+
+const store = () => useProjectStore.getState()
 import { useLayoutStore } from './state/layoutStore'
 import { useToastStore } from './state/toastStore'
 import { useRecentsStore } from './state/recentsStore'
@@ -71,7 +75,44 @@ export default function App() {
         e.preventDefault()
         setIsPlaying(!isPlaying)
       } else if (e.key === 'Backspace' || e.key === 'Delete') {
-        if (selectedClipId) removeClip(selectedClipId)
+        store().deleteSelection()
+      } else if (mod && e.altKey && e.code === 'KeyC') {
+        // ⌥⌘C / ⌥⌘V = copy / paste attributes (before plain ⌘C/⌘V).
+        e.preventDefault()
+        if (selectedClipId) store().copyAttributes(selectedClipId)
+      } else if (mod && e.altKey && e.code === 'KeyV') {
+        e.preventDefault()
+        store().pasteAttributesToSelection()
+      } else if (mod && !e.shiftKey && e.code === 'KeyC') {
+        e.preventDefault()
+        store().copySelection()
+      } else if (mod && !e.shiftKey && e.code === 'KeyX') {
+        e.preventDefault()
+        store().cutSelection()
+      } else if (mod && !e.shiftKey && e.code === 'KeyV') {
+        e.preventDefault()
+        store().paste()
+      } else if (mod && e.shiftKey && e.code === 'KeyG') {
+        e.preventDefault()
+        store().ungroupSelection()
+      } else if (mod && e.code === 'KeyG') {
+        e.preventDefault()
+        store().groupSelection()
+      } else if (!mod && e.altKey && e.code === 'KeyG') {
+        e.preventDefault()
+        void createCompoundClip()
+      } else if (!mod && !e.altKey && e.shiftKey && e.code === 'KeyF') {
+        if (selectedClipId) store().insertFreezeFrame(selectedClipId)
+      } else if (!mod && !e.altKey && !e.shiftKey && e.code === 'KeyV') {
+        // V toggles Deactivate / Activate for the selection.
+        const s = store()
+        const ids = selectionOf(s)
+        if (ids.length === 0) return
+        const all = ids.every((id) => s.project.tracks.some((t) => t.clips.some((c) => c.id === id && c.disabled)))
+        s.setSelectionDisabled(!all)
+      } else if (!mod && !e.altKey && !e.shiftKey && (e.code === 'KeyQ' || e.code === 'KeyW')) {
+        // Q / W = trim the selected clip's start / end to the playhead.
+        if (selectedClipId) store().trimClipToPlayhead(selectedClipId, e.code === 'KeyQ' ? 'start' : 'end')
       }
     }
     window.addEventListener('keydown', onKeyDown)
@@ -96,6 +137,7 @@ export default function App() {
       </div>
       <ResizeHandle orientation="horizontal" value={timelineHeight} onChange={setTimelineHeight} invert />
       <Timeline />
+      <CropDialog />
       <Toasts />
     </div>
   )

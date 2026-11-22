@@ -1,9 +1,9 @@
 ---
-name: run-freecut
-description: Build, run, and drive the freecut Electron app for agent-driven verification (screenshots, live store/DOM inspection). Use when asked to start freecut, screenshot it, or confirm a change works in the real app rather than just typechecking/unit tests.
+name: run-anycut
+description: Build, run, and drive the anycut Electron app for agent-driven verification (screenshots, live store/DOM inspection). Use when asked to start anycut, screenshot it, or confirm a change works in the real app rather than just typechecking/unit tests.
 ---
 
-freecut is an Electron + React + Vite desktop app (`npm run dev` for a human;
+anycut is an Electron + React + Vite desktop app (`npm run dev` for a human;
 this skill is the agent path). Drive it via the CDP REPL at
 `scripts/devDriver.mjs` — no Accessibility/Screen Recording permissions, no
 OS window-id lookups: screenshots go through the DevTools Protocol's own
@@ -68,22 +68,27 @@ window.confirm = () => true // auto-accept, then restore it after
 
 ## Gotchas
 
-- **`freecut-media://` is the hard-won fix for "nothing plays".** In dev
+- **Never steal focus / never touch the user's screen.** In dev the window is
+  shown with `showInactive()` (see CLAUDE.md). Drive it only through this
+  driver or Playwright; no `screencapture`, OS clicks, or `focus()` calls.
+  If port 9222 is taken by a stale instance, set `ANYCUT_DEBUG_PORT=9333`.
+
+- **`anycut-media://` is the hard-won fix for "nothing plays".** In dev
   mode the renderer loads from `http://localhost:5173`, not `file://`.
   `<video>`/`<audio>` elements loading a plain `file://` src from that
   origin are rejected by Chromium's media URL safety check
   (`MEDIA_ELEMENT_ERROR: Media load rejected by URL safety check`) —
   silently killing all preview playback. The fix: `electron/main/index.ts`
-  registers a privileged `freecut-media://` scheme backed by `net.fetch`
+  registers a privileged `anycut-media://` scheme backed by `net.fetch`
   (which also gives free Range-request support for scrubbing), and
   `electron/preload/index.ts`'s `fileUrl()` emits that scheme instead of
   `file://`. If preview playback breaks again, check this wiring first
   before suspecting the player code in `Preview.tsx`.
 - **Two Electron instances can coexist.** `launch` doesn't kill any
-  already-running freecut window; it just starts its own debug-enabled
+  already-running anycut window; it just starts its own debug-enabled
   one pointed at the same (possibly-already-running) Vite dev server.
   Kill stray instances with
-  `pkill -f "freecut-editor|Electron.app/Contents/MacOS/Electron|node_modules/.bin/vite"`
+  `pkill -f "anycut|Electron.app/Contents/MacOS/Electron|node_modules/.bin/vite"`
   if things get confusing.
 - **Killing the Electron child can kill Vite too** (they're tied together
   via `vite-plugin-electron`'s process lifecycle under `npm run dev`). If

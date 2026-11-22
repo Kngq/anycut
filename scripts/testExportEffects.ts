@@ -14,13 +14,13 @@ import {
 } from '../src/shared/types'
 
 /**
- * Validates that the effect/transition filter strings freecut generates are *real, valid
+ * Validates that the effect/transition filter strings anycut generates are *real, valid
  * ffmpeg* — not just well-formed TypeScript. For each effect type and a couple of the new
  * transition types, it builds a tiny two-clip project, runs the actual ffmpeg plan, and
  * asserts a non-empty mp4 comes out. A broken filter expression (bad escaping, wrong param,
  * nonexistent xfade name) makes ffmpeg exit non-zero, which fails the test.
  */
-const WORKDIR = process.env.FREECUT_TEST_DIR || path.join(process.cwd(), '.scratch-effects-export')
+const WORKDIR = process.env.ANYCUT_TEST_DIR || path.join(process.cwd(), '.scratch-effects-export')
 fs.mkdirSync(WORKDIR, { recursive: true })
 
 function run(args: string[], label: string): { ok: boolean; stderr: string } {

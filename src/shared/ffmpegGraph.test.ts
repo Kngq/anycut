@@ -79,9 +79,13 @@ describe('buildFfmpegPlan — rotate/flip (mirror)', () => {
     expect(plan.filterComplex).toContain('hflip')
   })
 
-  it('emits a rotate filter pinned to the canvas size for a rotated clip', () => {
+  it('rotates a clip into its full bounding box and places it back on the canvas', () => {
     const plan = buildFfmpegPlan(twoClipProject({ transformOnSecond: { ...defaultTransform(), rotation: 90 } }))
-    expect(plan.filterComplex).toMatch(/rotate=[\d.]+:ow=1080:oh=1920/)
+    // The 1080x1920 canvas frame turned 90° is 1920x1080 (nothing cropped, like the preview)…
+    expect(plan.filterComplex).toMatch(/rotate=[\d.]+:ow=1920:oh=1080/)
+    // …composited centered back onto the 1080x1920 black canvas.
+    expect(plan.filterComplex).toMatch(/color=c=black:s=1080x1920/)
+    expect(plan.filterComplex).toMatch(/overlay=x='1080\*\(0\.5\)-w\/2'/)
   })
 
   it('emits both hflip and rotate when a clip is mirrored and rotated', () => {
@@ -175,5 +179,30 @@ describe('atempoFactors', () => {
       }
       expect(product(factors)).toBeCloseTo(speed, 10)
     }
+  })
+})
+
+describe('text outline', () => {
+  it('maps a text stroke to drawtext borderw/bordercolor, and omits it otherwise', () => {
+    const p = twoClipProject()
+    const text = { id: 't1', kind: 'text' as const, trackId: 'tx', start: 0, duration: 2, text: 'Hi', fontSize: 60, color: 'white', bold: true, transform: defaultTransform() }
+    const withText = (stroke?: { color: string; width: number }): Project => ({
+      ...p,
+      tracks: [...p.tracks, { id: 'tx', type: 'text', name: 'Captions', clips: [{ ...text, ...(stroke ? { stroke } : {}) }], muted: false, hidden: false }]
+    })
+    expect(buildFfmpegPlan(withText({ color: 'black', width: 5 })).filterComplex).toContain(':borderw=5:bordercolor=black')
+    expect(buildFfmpegPlan(withText()).filterComplex).not.toContain('borderw')
+  })
+})
+
+describe('baked text overlay', () => {
+  it('overlays the PNG sequence instead of drawtext', () => {
+    const p = twoClipProject()
+    const text = { id: 't1', kind: 'text' as const, trackId: 'tx', start: 0, duration: 2, text: 'Hi', fontSize: 60, color: 'white', bold: true, transform: defaultTransform() }
+    const withText: Project = { ...p, tracks: [...p.tracks, { id: 'tx', type: 'text', name: 'Captions', clips: [text], muted: false, hidden: false }] }
+    const plan = buildFfmpegPlan(withText, { textOverlay: { pattern: '/tmp/x/%06d.png', fps: 30 } })
+    expect(plan.inputs.join(' ')).toContain('-framerate 30 -i /tmp/x/%06d.png')
+    expect(plan.filterComplex).toMatch(/overlay=0:0:format=auto:eof_action=pass/)
+    expect(plan.filterComplex).not.toContain('drawtext')
   })
 })

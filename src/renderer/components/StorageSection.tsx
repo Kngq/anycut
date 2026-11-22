@@ -4,6 +4,7 @@ import { useProjectStore } from '../state/projectStore'
 import { useRecentsStore } from '../state/recentsStore'
 import { useToastStore } from '../state/toastStore'
 import { refreshAsset } from '../media'
+import { sourceOverrideFiles } from '@shared/motionBlur'
 
 const LABELS: Record<keyof CacheUsage['kinds'], string> = {
   proxies: 'Preview proxies',
@@ -11,7 +12,8 @@ const LABELS: Record<keyof CacheUsage['kinds'], string> = {
   thumbnails: 'Filmstrips',
   waveforms: 'Waveforms',
   mediainfo: 'Media info',
-  mattes: 'Background removals'
+  mattes: 'Background removals',
+  motionblur: 'Motion blur'
 }
 
 function formatBytes(n: number): string {
@@ -45,7 +47,7 @@ export default function StorageSection() {
     const open = [
       ...project.assets.map((a) => a.path),
       ...project.tracks.flatMap((t) =>
-        t.clips.flatMap((c) => (c.kind === 'media' && c.sourceOverride ? [c.sourceOverride.path, c.sourceOverride.previewPath ?? ''].filter(Boolean) : []))
+        t.clips.flatMap((c) => (c.kind === 'media' ? sourceOverrideFiles(c.sourceOverride) : []))
       )
     ]
     const res = await window.api.cleanCache(0, recents, open)

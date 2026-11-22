@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import ffmpegPath from 'ffmpeg-static'
+import { ffmpegPath } from './binaries'
 import type { Waveform } from '@shared/ipc'
 import { cacheKey, dedupe, entryPath, readJsonEntry, stampSource, writeFileAtomic, writeMeta } from './cache'
 
@@ -33,7 +33,7 @@ export async function ensureWaveform(filePath: string): Promise<Waveform | null>
       await writeMeta('waveforms', key, src)
       return waveform
     } catch (err) {
-      console.error('[freecut] waveform generation failed for', filePath, err)
+      console.error('[anycut] waveform generation failed for', filePath, err)
       return null
     }
   })

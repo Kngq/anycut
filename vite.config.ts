@@ -14,7 +14,8 @@ export default defineConfig({
     react(),
     electron({
       main: {
-        entry: 'electron/main/index.ts',
+        // captionWorker runs in its own utilityProcess (forked by captions.ts).
+        entry: { index: 'electron/main/index.ts', captionWorker: 'electron/main/captionWorker.ts' },
         vite: {
           resolve: {
             alias: {
@@ -24,7 +25,7 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron/main',
             rollupOptions: {
-              external: ['fluent-ffmpeg', 'ffmpeg-static', 'ffprobe-static', 'onnxruntime-node']
+              external: ['fluent-ffmpeg', 'ffmpeg-static', 'ffprobe-static', 'onnxruntime-node', '@huggingface/transformers']
             }
           }
         }

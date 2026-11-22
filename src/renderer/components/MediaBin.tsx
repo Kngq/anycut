@@ -1,5 +1,7 @@
-import { useState } from 'react'
-import type { ReactNode } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import FiltersPanel from './FiltersPanel'
+import type { ReactNode, WheelEvent as ReactWheelEvent } from 'react'
+import { useBinRequest } from '../state/layoutStore'
 import { canHaveTransition, useProjectStore } from '../state/projectStore'
 import { EffectPreview, TransitionPreview } from './EffectPreview'
 import CaptionsPanel from './CaptionsPanel'
@@ -15,7 +17,7 @@ import {
 } from '@shared/types'
 import { ASSET_DRAG_MIME, assetsFromPaths, droppedFilePaths } from '../media'
 import { locateMissing } from '../projectIO'
-import { endFxDrag, startFxDrag } from '../dragPayload'
+import { endAssetDrag, endFxDrag, startAssetDrag, startFxDrag } from '../dragPayload'
 import { DEFAULT_TRANSITION_SECONDS } from '@shared/dropTargets'
 
 function TabIcon({ children }: { children: ReactNode }) {
@@ -111,7 +113,7 @@ const TABS: { id: TabId; label: string; enabled: boolean; icon: ReactNode }[] = 
   {
     id: 'filters',
     label: 'Filters',
-    enabled: false,
+    enabled: true,
     icon: (
       <TabIcon>
         <circle cx="9" cy="12" r="6" />
@@ -146,12 +148,37 @@ export default function MediaBin() {
   const previewAssetId = useProjectStore((s) => s.previewAssetId)
   const missingAssetIds = useProjectStore((s) => s.missingAssetIds)
   const playhead = useProjectStore((s) => s.playhead)
+  // The tab row is wider than a narrow panel. It scrolls sideways (wheel included), and the edges
+  // fade where more tabs are hidden, so tabs past the edge (Captions) are discoverable.
+  const tabsRef = useRef<HTMLDivElement>(null)
+  const binRef = useRef<HTMLDivElement>(null)
+  const [tabOverflow, setTabOverflow] = useState({ left: false, right: false })
+  function updateTabOverflow() {
+    const el = tabsRef.current
+    if (!el) return
+    const next = { left: el.scrollLeft > 1, right: el.scrollLeft + el.clientWidth < el.scrollWidth - 1 }
+    setTabOverflow((prev) => (prev.left === next.left && prev.right === next.right ? prev : next))
+  }
+  function onTabsWheel(e: ReactWheelEvent<HTMLDivElement>) {
+    if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY
+  }
+  useEffect(() => {
+    updateTabOverflow()
+    const ro = new ResizeObserver(updateTabOverflow)
+    if (binRef.current) ro.observe(binRef.current)
+    return () => ro.disconnect()
+  }, [])
+
   const selectedClipId = useProjectStore((s) => s.selectedClipId)
   const addClipEffect = useProjectStore((s) => s.addClipEffect)
   const removeClipEffect = useProjectStore((s) => s.removeClipEffect)
   const setClipTransition = useProjectStore((s) => s.setClipTransition)
   const [dropActive, setDropActive] = useState(false)
   const [activeTab, setActiveTab] = useState<TabId>('media')
+  const binRequest = useBinRequest((s) => s.request)
+  useEffect(() => {
+    if (binRequest) setActiveTab(binRequest.tab as TabId)
+  }, [binRequest])
 
   // The clip the Effects/Transitions tabs act on (mirrors the Inspector's selection).
   let selectedClip: Clip | null = null
@@ -250,7 +277,9 @@ export default function MediaBin() {
                 onDragStart={(e) => {
                   e.dataTransfer.setData(ASSET_DRAG_MIME, asset.id)
                   e.dataTransfer.effectAllowed = 'copy'
+                  startAssetDrag(asset.id)
                 }}
+                onDragEnd={endAssetDrag}
                 onClick={() => setPreviewAsset(asset.id)}
                 onDoubleClick={() => handleAddToTimeline(asset)}
                 title="Click to preview, drag onto the timeline, or double-click to add"
@@ -289,19 +318,23 @@ export default function MediaBin() {
 
   return (
     <div
+      ref={binRef}
       className={`panel media-bin ${dropActive ? 'drop-active' : ''}`}
       onDragOver={onDragOver}
       onDragLeave={() => setDropActive(false)}
       onDrop={onDrop}
     >
-      <div className="media-tabs">
+      <div className={`media-tabs ${tabOverflow.left ? 'more-left' : ''} ${tabOverflow.right ? 'more-right' : ''}`} ref={tabsRef} onScroll={updateTabOverflow} onWheel={onTabsWheel}>
         {TABS.map((tab) => (
           <button
             key={tab.id}
             className={`media-tab ${tab.id === activeTab ? 'active' : ''}`}
             disabled={!tab.enabled}
             title={tab.enabled ? undefined : 'Coming soon'}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={(e) => {
+              setActiveTab(tab.id)
+              e.currentTarget.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' })
+            }}
           >
             {tab.icon}
             <span>{tab.label}</span>
@@ -380,6 +413,7 @@ export default function MediaBin() {
           )}
         </div>
       )}
+      {activeTab === 'filters' && <FiltersPanel selectedClip={selectedClip} />}
       {activeTab === 'transitions' && (
         <div className="media-bin-body">
           <div className="empty-hint" style={{ padding: '0 0 8px' }}>

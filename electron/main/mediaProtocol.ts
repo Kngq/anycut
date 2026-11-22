@@ -34,7 +34,7 @@ function mediaUrlToFilePath(url: string): string {
 }
 
 /**
- * Serves a local file for the freecut-media:// scheme by reading it directly with Node's fs in
+ * Serves a local file for the anycut-media:// scheme by reading it directly with Node's fs in
  * the main process, with manual byte-range support (required for <video> scrubbing/seeking) —
  * deliberately NOT net.fetch(pathToFileURL(...)), which goes through Chromium's sandboxed
  * Network Service utility process. That process silently failed ("Failed to fetch", no real
@@ -49,7 +49,7 @@ export async function handleMediaRequest(request: Request): Promise<Response> {
   try {
     stats = await stat(filePath)
   } catch (err) {
-    console.error('[freecut-media] stat failed for', JSON.stringify(filePath), 'from url', request.url, err)
+    console.error('[anycut-media] stat failed for', JSON.stringify(filePath), 'from url', request.url, err)
     return new Response('Not found', { status: 404 })
   }
 
@@ -70,7 +70,10 @@ export async function handleMediaRequest(request: Request): Promise<Response> {
         'Content-Range': `bytes ${start}-${end}/${stats.size}`,
         'Accept-Ranges': 'bytes',
         'Content-Length': String(end - start + 1),
-        'Content-Type': contentType
+        'Content-Type': contentType,
+        // The dev renderer (http://localhost) reads frames back into canvas/WebGL (filters, crop
+        // backdrop); media elements load with crossOrigin=anonymous, which needs this.
+        'Access-Control-Allow-Origin': '*'
       }
     })
   }
@@ -81,7 +84,8 @@ export async function handleMediaRequest(request: Request): Promise<Response> {
     headers: {
       'Content-Length': String(stats.size),
       'Accept-Ranges': 'bytes',
-      'Content-Type': contentType
+      'Content-Type': contentType,
+      'Access-Control-Allow-Origin': '*'
     }
   })
 }

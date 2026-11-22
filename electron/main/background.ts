@@ -2,42 +2,96 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { createWriteStream } from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
 import { app, net } from 'electron'
-import ffmpegPath from 'ffmpeg-static'
-import type { BackgroundStatus, BackgroundResult } from '@shared/ipc'
+import { ffmpegPath } from './binaries'
+import type { BackgroundStatus, BackgroundResult, MattingModelId } from '@shared/ipc'
 import { cacheKey, entryPath, stampSource, writeMeta } from './cache'
+import { matteToGray, parseDurationSec, parseFps, rgbToNchw, smoothMatte } from '@shared/matte'
 
 /**
  * Local, fully-offline background removal (per-frame foreground matting) for video clips.
  *
- * Pipeline: ffmpeg extracts frames → u2netp ONNX matte per frame → matte scaled to the frame
- * (scale2ref) and merged as alpha → reassembled at the SOURCE fps as ProRes 4444 (export) plus a
+ * Pipeline: ffmpeg decodes frames → ONNX matte per frame (MODNet for people, ISNet for anything) → matte scaled to the frame
+ * and merged as alpha → reassembled at the SOURCE fps as ProRes 4444 (export) plus a
  * VP9+alpha WebM (preview, since Chromium can't decode ProRes). Output is content-keyed in
  * `<userData>/Cache/mattes/`. The renderer applies it to one clip via `sourceOverride` (CapCut swaps
  * a timeline material's path the same way); audio keeps coming from the original source.
  *
- * Verified on real files: a 2 s 24 fps clip mattes in ~5 s, alpha is 0xff on the subject and 0x00
- * on the background, fps/duration match the source, and an unchanged source re-bakes from cache
- * in ~10 ms.
+ * Verified on real files: a 3 s 1440x2560 30 fps phone clip bakes in ~10 s with the People model
+ * (~87 s with Any subject), every source frame is kept, alpha is 0xff on the subject and 0x00 on the
+ * background, fps/duration match the source, and an unchanged source re-bakes from cache
+ * in ~10 ms. Every frame of the clip is matted, so the cutout follows the subject throughout.
  *
  * Needs the optional `onnxruntime-node` package (prebuilt darwin-arm64, no compile; not installed
- * by default to keep the base app light) plus a one-time 4.6 MB model download. When either is
+ * by default to keep the base app light) plus a one-time model download (25 MB / 170 MB). When either is
  * missing this reports cleanly instead of failing.
  */
 
-const MODEL_NAME = 'u2netp.onnx'
-// U²-Net-portable (u2netp), from rembg's own GitHub release (Apache-2.0). 4.6 MB versus u2net's
-// 176 MB, same architecture and 320x320 input, slightly softer edges. Verified end to end: a
-// bright subject on a dark background mattes to alpha 0xff on the subject and 0x00 elsewhere.
-const MODEL_URL = 'https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx'
-const MODEL_INPUT = 320 // U²-Net expects 320x320 NCHW
+/** One matting network: where to get it and how to feed it. Both are Apache-2.0. */
+interface MattingModel {
+  id: MattingModelId
+  label: string
+  description: string
+  file: string
+  url: string
+  sizeMB: number
+  /** 'fixed': squash to size x size. 'aspect': keep the frame's aspect, long side = size, both
+   *  sides rounded to a multiple of 32 (MODNet's stride). */
+  resize: 'fixed' | 'aspect'
+  size: number
+  mean: [number, number, number]
+  std: [number, number, number]
+  /** 'alpha': output already is a 0..1 matte. 'minmax': saliency map, stretch to 0..1. */
+  output: 'alpha' | 'minmax'
+}
+
+// Benchmarked on real CapCut talking-head and screen-recording frames (M-series CPU, onnxruntime-
+// node): MODNet ~130 ms/frame with clean hair edges and no background leakage; ISNet ~870 ms/frame,
+// works on non-human subjects but let some background through on people. (u2netp, the previous
+// model, was as fast as MODNet but haloed badly; BiRefNet-lite was ~12 s/frame — too slow for video.)
+export const MATTING_MODELS: Record<MattingModelId, MattingModel> = {
+  person: {
+    id: 'person',
+    label: 'People',
+    description: 'Best for people. Fast, clean hair and edges.',
+    file: 'modnet.onnx',
+    url: 'https://huggingface.co/Xenova/modnet/resolve/main/onnx/model.onnx',
+    sizeMB: 25,
+    resize: 'aspect',
+    size: 512,
+    mean: [0.5, 0.5, 0.5],
+    std: [0.5, 0.5, 0.5],
+    output: 'alpha'
+  },
+  general: {
+    id: 'general',
+    label: 'Any subject',
+    description: 'Objects, pets, products. About 7× slower.',
+    file: 'isnet-general-use.onnx',
+    url: 'https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx',
+    sizeMB: 170,
+    resize: 'fixed',
+    size: 1024,
+    mean: [0.5, 0.5, 0.5],
+    std: [1, 1, 1],
+    output: 'minmax'
+  }
+}
 
 function modelsDir(): string {
   return path.join(app.getPath('userData'), 'models')
 }
-function modelPath(): string {
-  return path.join(modelsDir(), MODEL_NAME)
+function modelPath(id: MattingModelId): string {
+  return path.join(modelsDir(), MATTING_MODELS[id].file)
+}
+
+/** Network input dims for a frame. MODNet keeps the aspect ratio (a squashed portrait loses edge
+ *  detail); ISNet is trained on a fixed square. */
+function inputDims(m: MattingModel, frameW: number, frameH: number): { w: number; h: number } {
+  if (m.resize === 'fixed' || !frameW || !frameH) return { w: m.size, h: m.size }
+  const scale = m.size / Math.max(frameW, frameH)
+  const r32 = (v: number) => Math.max(32, Math.round((v * scale) / 32) * 32)
+  return { w: r32(frameW), h: r32(frameH) }
 }
 
 async function fileExists(p: string): Promise<boolean> {
@@ -75,30 +129,51 @@ async function loadOnnx(): Promise<OrtModule | null> {
   }
 }
 
-/** Reports whether background removal can run: the ONNX runtime dep + the downloaded model. */
+/** Reports whether background removal can run: the ONNX runtime dep + which models are downloaded. */
 export async function backgroundStatus(): Promise<BackgroundStatus> {
-  const [onnx, hasModel] = await Promise.all([loadOnnx(), fileExists(modelPath())])
+  const onnx = await loadOnnx()
+  const models = await Promise.all(
+    Object.values(MATTING_MODELS).map(async (m) => ({
+      id: m.id,
+      label: m.label,
+      description: m.description,
+      sizeMB: m.sizeMB,
+      downloaded: await fileExists(modelPath(m.id))
+    }))
+  )
   return {
     runtimeAvailable: onnx !== null,
-    modelDownloaded: hasModel,
-    modelName: MODEL_NAME,
+    models,
     installHint: onnx === null ? 'Install the local ML runtime to enable background removal: `npm i onnxruntime-node`.' : undefined
   }
 }
 
-/** Downloads the matting model once into the app data dir (idempotent, atomic). */
-export async function downloadBackgroundModel(): Promise<{ ok: boolean; error?: string }> {
-  if (await fileExists(modelPath())) return { ok: true }
+/** Downloads a matting model once into the app data dir (idempotent, atomic). */
+export async function downloadBackgroundModel(
+  id: MattingModelId,
+  onProgress?: (ratio: number) => void
+): Promise<{ ok: boolean; error?: string }> {
+  const model = MATTING_MODELS[id]
+  if (!model) return { ok: false, error: `unknown model "${id}"` }
+  const dest = modelPath(id)
+  if (await fileExists(dest)) return { ok: true }
   await fs.mkdir(modelsDir(), { recursive: true })
-  const tmp = `${modelPath()}.download`
+  const tmp = `${dest}.download`
   try {
     await new Promise<void>((resolve, reject) => {
-      const request = net.request(MODEL_URL)
+      const request = net.request(model.url)
       request.on('response', (response) => {
         const status = (response as unknown as { statusCode: number }).statusCode
         if (status >= 400) return reject(new Error(`model download failed: HTTP ${status}`))
+        const lenHeader = response.headers['content-length']
+        const total = Number(Array.isArray(lenHeader) ? lenHeader[0] : lenHeader) || model.sizeMB * 1024 * 1024
+        let received = 0
         const out = createWriteStream(tmp)
-        response.on('data', (c) => out.write(c))
+        response.on('data', (c) => {
+          out.write(c)
+          received += c.length
+          onProgress?.(Math.min(1, received / total))
+        })
         response.on('end', () => {
           out.end()
           out.on('finish', () => resolve())
@@ -108,7 +183,9 @@ export async function downloadBackgroundModel(): Promise<{ ok: boolean; error?: 
       request.on('error', reject)
       request.end()
     })
-    await fs.rename(tmp, modelPath())
+    await fs.rename(tmp, dest)
+    // The old u2netp model is no longer used.
+    await fs.unlink(path.join(modelsDir(), 'u2netp.onnx')).catch(() => {})
     return { ok: true }
   } catch (err) {
     await fs.unlink(tmp).catch(() => {})
@@ -116,187 +193,240 @@ export async function downloadBackgroundModel(): Promise<{ ok: boolean; error?: 
   }
 }
 
-function ffmpeg(args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (!ffmpegPath) return reject(new Error('ffmpeg not available'))
-    const proc = spawn(ffmpegPath, args)
-    let stderr = ''
-    proc.stderr.on('data', (c) => (stderr += c))
+/** Spawned ffmpeg with its stderr tail kept for error messages; `done` settles on exit. */
+function startFfmpeg(args: string[], stdin: 'pipe' | 'ignore' = 'ignore') {
+  if (!ffmpegPath) throw new Error('ffmpeg not available')
+  const proc = spawn(ffmpegPath, ['-hide_banner', '-loglevel', 'error', ...args], { stdio: [stdin, 'pipe', 'pipe'] })
+  let stderr = ''
+  proc.stderr!.on('data', (c) => (stderr = (stderr + c).slice(-2000)))
+  const done = new Promise<void>((resolve, reject) => {
     proc.on('error', reject)
-    proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-300)}`))))
+    proc.on('close', (code, signal) =>
+      code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code ?? signal}: ${stderr.trim().slice(-300)}`))
+    )
+  })
+  done.catch(() => {}) // observed by the caller; avoid an unhandled rejection if it never awaits
+  return { proc, done }
+}
+
+/** Writes to a child's stdin honoring backpressure (so a long clip never buffers in memory). */
+function writeChunk(stream: NodeJS.WritableStream, chunk: Uint8Array): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (err: Error) => reject(err)
+    stream.once('error', onError)
+    const flushed = stream.write(chunk, (err) => {
+      if (err) reject(err)
+    })
+    const finish = () => {
+      stream.removeListener('error', onError)
+      resolve()
+    }
+    if (flushed) finish()
+    else stream.once('drain', finish)
   })
 }
 
 /**
- * Removes the background from a video, writing an alpha-channel ProRes 4444 .mov next to a temp
- * dir and returning its path. Pipeline: extract PNG frames → per-frame U²-Net matte via ONNX →
- * apply matte as alpha → reassemble with ProRes 4444 (keeps audio from the source).
+ * Removes the background from a video: an alpha ProRes 4444 .mov (export) plus a VP9+alpha WebM
+ * (preview), both content-keyed in the cache.
+ *
+ * Streamed, three processes running concurrently with nothing per-frame on disk:
+ *   decoder ffmpeg  → raw RGB frames already scaled to the network's input size (stdout)
+ *   this process    → ONNX matte per frame, edge-flicker smoothing → raw gray mattes
+ *   encoder ffmpeg  ← mattes on stdin + the source decoded at full res; scales each matte up,
+ *                     alphamerges, and writes BOTH outputs in one pass (split filter).
+ * Both sides re-time frames to index / fps, so the matte for frame N always merges with source
+ * frame N even on variable-frame-rate phone footage. (The old pipeline wrote two PNGs and spawned
+ * two ffmpegs per frame; that overhead was ~70% of the run time with the fast People model.)
  *
  * Returns ok:false with a reason when the runtime/model aren't available (graceful).
  */
-export async function removeBackground(inputPath: string, onProgress?: (ratio: number) => void): Promise<BackgroundResult> {
+export async function removeBackground(
+  inputPath: string,
+  modelId: MattingModelId,
+  onProgress?: (ratio: number) => void
+): Promise<BackgroundResult> {
+  const model = MATTING_MODELS[modelId]
+  if (!model) return { ok: false, error: `unknown model "${modelId}"` }
   const onnx = await loadOnnx()
   if (!onnx) return { ok: false, error: 'Local ML runtime (onnxruntime-node) is not installed.' }
-  if (!(await fileExists(modelPath()))) return { ok: false, error: 'Background-removal model not downloaded yet.' }
+  if (!(await fileExists(modelPath(modelId)))) return { ok: false, error: `The ${model.label} model isn't downloaded yet.` }
 
   // The bake is content-keyed like every other derived artifact: re-running on an unchanged source
   // returns the cached file instantly, and the output survives restarts (it's referenced by the
   // clip's sourceOverride, so it must not live in a temp dir that gets wiped).
   const src = await stampSource(inputPath)
   if (!src) return { ok: false, error: 'source file is missing' }
-  const key = cacheKey('mattes', src)
+  // Model is part of the key: the same clip can be baked with either model.
+  const key = `${cacheKey('mattes', src)}-${modelId}`
   const outPath = await entryPath('mattes', key, '.mov')
   const previewOut = await entryPath('mattes', key, '.webm')
   if ((await fileExists(outPath)) && (await fileExists(previewOut))) return { ok: true, outputPath: outPath, previewPath: previewOut }
 
-  const work = await fs.mkdtemp(path.join(os.tmpdir(), 'freecut-bg-'))
-  const framesDir = path.join(work, 'frames')
-  const outDir = path.join(work, 'out')
-  await fs.mkdir(framesDir, { recursive: true })
-  await fs.mkdir(outDir, { recursive: true })
-  const fps = await sourceFps(inputPath)
+  const { fps, width, height, durationSec } = await sourceInfo(inputPath)
+  const dims = inputDims(model, width, height)
+  const pixels = dims.w * dims.h
+  const frameBytes = pixels * 3
+  const expectedFrames = Math.max(1, Math.round(durationSec * (parseFps(fps) || 30)))
+  // Frame index → seconds at the source rate, applied to both the source and the matte stream.
+  const retime = `setpts=N/(${fps})/TB`
+  // Matte → full frame size. An explicit scale, not scale2ref: scale2ref (deprecated) emitted a
+  // duplicate final frame when the mattes arrive slowly over the pipe. Display size is known from
+  // the probe; scale2ref is only the fallback for a source we couldn't size.
+  const merge =
+    width && height
+      ? `[0:v:0]${retime}[rgb];[1:v]${retime},scale=${width}:${height}:flags=bicubic[a]`
+      : `[0:v:0]${retime}[rgb0];[1:v]${retime}[a0];[a0][rgb0]scale2ref=flags=bicubic[a][rgb]`
+  const tmpMov = `${outPath}.tmp.mov`
+  const tmpWebm = `${previewOut}.tmp.webm`
 
+  let decoder: ReturnType<typeof startFfmpeg> | null = null
+  let encoder: ReturnType<typeof startFfmpeg> | null = null
   try {
-    // 1. Extract frames (keep source fps via -vsync 0) and the fps for reassembly.
-    await ffmpeg(['-y', '-i', inputPath, '-vsync', '0', path.join(framesDir, 'f%06d.png')])
-    const frames = (await fs.readdir(framesDir)).filter((f) => f.endsWith('.png')).sort()
-    if (frames.length === 0) return { ok: false, error: 'no frames extracted' }
+    const session = await onnx.InferenceSession.create(modelPath(modelId))
 
-    // 2. Load the model once and matte each frame. We rely on sharp-like decoding via the
-    //    canvas is unavailable in main; instead we decode/resize with ffmpeg to raw RGB at the
-    //    model input size, run inference, and write an RGBA PNG back with ffmpeg using the matte
-    //    as alpha. (Kept per-frame and simple; temporal smoothing is a future refinement.)
-    const session = await onnx.InferenceSession.create(modelPath())
-
-    for (let i = 0; i < frames.length; i++) {
-      const frame = path.join(framesDir, frames[i])
-      // Decode+resize the frame to MODEL_INPUT^2 raw RGB for the network input.
-      const rawSmall = path.join(work, 'in.rgb')
-      await ffmpeg(['-y', '-i', frame, '-vf', `scale=${MODEL_INPUT}:${MODEL_INPUT}`, '-pix_fmt', 'rgb24', '-f', 'rawvideo', rawSmall])
-      const rgb = await fs.readFile(rawSmall)
-
-      // NCHW float input normalized to [0,1] then mean/std per U²-Net (0.485.. / 0.229..).
-      const n = MODEL_INPUT * MODEL_INPUT
-      const input = new Float32Array(3 * n)
-      const mean = [0.485, 0.456, 0.406]
-      const std = [0.229, 0.224, 0.225]
-      for (let p = 0; p < n; p++) {
-        for (let c = 0; c < 3; c++) {
-          input[c * n + p] = (rgb[p * 3 + c] / 255 - mean[c]) / std[c]
-        }
-      }
-      const tensor = new onnx.Tensor('float32', input, [1, 3, MODEL_INPUT, MODEL_INPUT])
-      const feeds: Record<string, unknown> = { [session.inputNames[0]]: tensor }
-      const results = await session.run(feeds)
-      const matte = results[session.outputNames[0]].data as Float32Array
-
-      // Normalize matte to 0..255 and write a MODEL_INPUT^2 grayscale PNG (the alpha source).
-      let min = Infinity
-      let max = -Infinity
-      for (const v of matte) {
-        if (v < min) min = v
-        if (v > max) max = v
-      }
-      const range = max - min || 1
-      const gray = Buffer.alloc(n)
-      for (let p = 0; p < n; p++) gray[p] = Math.round(((matte[p] - min) / range) * 255)
-      const matteRaw = path.join(work, 'matte.gray')
-      await fs.writeFile(matteRaw, gray)
-
-      // Compose: scale the matte back up to the frame size and attach it as alpha.
-      const outFrame = path.join(outDir, frames[i])
-      await ffmpeg([
+    decoder = startFfmpeg(['-i', inputPath, '-map', '0:v:0', '-vf', `scale=${dims.w}:${dims.h}`, '-fps_mode', 'passthrough', '-pix_fmt', 'rgb24', '-f', 'rawvideo', 'pipe:1'])
+    encoder = startFfmpeg(
+      [
         '-y',
         '-i',
-        frame,
+        inputPath,
         '-f',
         'rawvideo',
         '-pix_fmt',
         'gray',
         '-s',
-        `${MODEL_INPUT}x${MODEL_INPUT}`,
+        `${dims.w}x${dims.h}`,
+        '-framerate',
+        fps,
         '-i',
-        matteRaw,
+        'pipe:0',
         '-filter_complex',
-        `[1:v][0:v]scale2ref[a][rgb];[rgb][a]alphamerge`,
+        // No -shortest: phone audio often ends a frame or two before the video, and trimming to it
+        // would drop the clip's last frames (the timeline's audio comes from the original anyway).
+        `${merge};[rgb][a]alphamerge=shortest=1,split[mov][web]`,
+        // Export master: ProRes 4444 with alpha, PCM audio (always valid in MOV).
+        '-map',
+        '[mov]',
+        '-map',
+        '0:a?',
+        '-fps_mode',
+        'passthrough',
+        '-c:v',
+        'prores_ks',
+        '-profile:v',
+        '4444',
         '-pix_fmt',
-        'rgba',
-        outFrame
-      ])
-      onProgress?.((i + 1) / frames.length)
+        'yuva444p10le',
+        '-c:a',
+        'pcm_s16le',
+        tmpMov,
+        // Preview: Chromium can't decode ProRes 4444, but it plays VP9 with alpha in WebM.
+        '-map',
+        '[web]',
+        '-map',
+        '0:a?',
+        '-fps_mode',
+        'passthrough',
+        '-c:v',
+        'libvpx-vp9',
+        '-pix_fmt',
+        'yuva420p',
+        '-b:v',
+        '0',
+        '-crf',
+        '34',
+        '-deadline',
+        'realtime',
+        '-cpu-used',
+        '8',
+        '-row-mt',
+        '1',
+        '-c:a',
+        'libopus',
+        tmpWebm
+      ],
+      'pipe'
+    )
+    const encIn = encoder.proc.stdin!
+    // A failed encoder surfaces as an EPIPE on write; prefer its real stderr in that case.
+    const encoderFailed = encoder.done.then(
+      () => null,
+      (err: Error) => err
+    )
+
+    const input = new Float32Array(3 * pixels)
+    let prevGray: Uint8Array | null = null
+    let pending: Buffer = Buffer.alloc(0)
+    let frames = 0
+
+    const processFrame = async (rgb: Uint8Array) => {
+      rgbToNchw(rgb, pixels, model.mean, model.std, input)
+      const tensor = new onnx.Tensor('float32', input, [1, 3, dims.h, dims.w])
+      const results = await session.run({ [session.inputNames[0]]: tensor })
+      const gray = smoothMatte(matteToGray(results[session.outputNames[0]].data, model.output), prevGray)
+      prevGray = gray
+      await writeChunk(encIn, gray)
+      frames++
+      onProgress?.(Math.min(0.99, frames / expectedFrames))
     }
 
-    // 3. Reassemble to ProRes 4444 with alpha, muxing the source audio.
-    await ffmpeg([
-      '-y',
-      '-framerate',
-      fps,
-      '-i',
-      path.join(outDir, 'f%06d.png'),
-      '-i',
-      inputPath,
-      '-map',
-      '0:v',
-      '-map',
-      '1:a?',
-      '-c:v',
-      'prores_ks',
-      '-profile:v',
-      '4444',
-      '-pix_fmt',
-      'yuva444p10le',
-      // PCM is always valid in a MOV (stream-copying e.g. Opus or Vorbis into MOV fails).
-      '-c:a',
-      'pcm_s16le',
-      '-shortest',
-      `${outPath}.tmp.mov`
-    ])
-    await fs.rename(`${outPath}.tmp.mov`, outPath)
+    try {
+      for await (const chunk of decoder.proc.stdout! as AsyncIterable<Buffer>) {
+        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk
+        let off = 0
+        while (pending.length - off >= frameBytes) {
+          await processFrame(pending.subarray(off, off + frameBytes))
+          off += frameBytes
+        }
+        pending = off ? pending.subarray(off) : pending
+      }
+      await decoder.done
+      if (frames === 0) throw new Error('no frames decoded')
+      encIn.end()
+      await encoder.done
+    } catch (err) {
+      const encErr = await Promise.race([encoderFailed, new Promise<null>((r) => setTimeout(() => r(null), 200))])
+      throw encErr ?? err
+    }
 
-    // Preview copy: Chromium can't decode ProRes 4444, but it plays VP9 with alpha in WebM.
-    await ffmpeg([
-      '-y',
-      '-i',
-      outPath,
-      '-c:v',
-      'libvpx-vp9',
-      '-pix_fmt',
-      'yuva420p',
-      '-b:v',
-      '0',
-      '-crf',
-      '34',
-      '-deadline',
-      'realtime',
-      '-cpu-used',
-      '8',
-      '-c:a',
-      'libopus',
-      `${previewOut}.tmp.webm`
-    ])
-    await fs.rename(`${previewOut}.tmp.webm`, previewOut)
+    await fs.rename(tmpMov, outPath)
+    await fs.rename(tmpWebm, previewOut)
     await writeMeta('mattes', key, src)
+    onProgress?.(1)
     return { ok: true, outputPath: outPath, previewPath: previewOut }
   } catch (err) {
-    await fs.unlink(`${outPath}.tmp.mov`).catch(() => {})
-    await fs.unlink(`${previewOut}.tmp.webm`).catch(() => {})
+    decoder?.proc.kill('SIGKILL')
+    encoder?.proc.kill('SIGKILL')
+    await fs.unlink(tmpMov).catch(() => {})
+    await fs.unlink(tmpWebm).catch(() => {})
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
-  } finally {
-    // Frames + mattes for a long clip can be gigabytes; never leave them behind.
-    await fs.rm(work, { recursive: true, force: true }).catch(() => {})
   }
 }
 
-/** Source frame rate as an ffmpeg rational (e.g. "30000/1001"), so the reassembled bake keeps
- *  exactly the source's timing. Falls back to 30. */
-function sourceFps(inputPath: string): Promise<string> {
-  return new Promise((resolve) => {
+/** Source frame rate as an ffmpeg rational (e.g. "30000/1001"), so the bake keeps exactly the
+ *  source's timing (falls back to 30), plus the display size (0 when unknown) and duration. */
+function sourceInfo(inputPath: string): Promise<{ fps: string; width: number; height: number; durationSec: number }> {
+  return new Promise((resolveInfo) => {
+    let width = 0
+    let height = 0
+    let durationSec = 0
+    const resolve = (fps: string) => resolveInfo({ fps, width, height, durationSec })
     if (!ffmpegPath) return resolve('30')
     const proc = spawn(ffmpegPath, ['-i', inputPath])
     let stderr = ''
     proc.stderr.on('data', (c) => (stderr += c))
     proc.on('error', () => resolve('30'))
     proc.on('close', () => {
+      durationSec = parseDurationSec(stderr)
+      const size = /Video:.*?, (\d{2,5})x(\d{2,5})/.exec(stderr)
+      if (size) {
+        width = Number(size[1])
+        height = Number(size[2])
+        // Phone footage is often stored landscape with a 90°/270° rotation; size the matte input
+        // for how it actually displays.
+        if (/rotation of -?90|rotation of -?270|rotate\s*:\s*-?(90|270)/.test(stderr)) [width, height] = [height, width]
+      }
       // ffmpeg prints e.g. "29.97 fps" / "30 fps" / "23.98 fps" on the video stream line.
       const m = /, (\d+(?:\.\d+)?) fps/.exec(stderr)
       if (!m) return resolve('30')

@@ -44,7 +44,7 @@ inspired by CapCut's UX, using its own `.fcproj` JSON project format. The guidin
   `Toolbar.tsx`, `Home.tsx`, `EffectPreview.tsx`, `CaptionsPanel.tsx`, `BackgroundRemovalButton.tsx`,
   `SpeedPanel.tsx`, `StorageSection.tsx`.
 - `electron/main/` — `export.ts`, `cache.ts` (content-keyed derived-media cache), `proxy.ts`,
-  `probe.ts`, `thumbnails.ts`, `waveform.ts`, `relink.ts` (missing-media), `transcribe.ts`
+  `probe.ts`, `thumbnails.ts`, `waveform.ts`, `relink.ts` (missing-media), `captions.ts` + `captionWorker.ts`
   (captions), `background.ts` (bg removal), `mediaProtocol.ts`.
 - `src/renderer/projectIO.ts` — the single open/save path (lock, `.bak` recovery, offline check,
   re-enrich, relink). `src/renderer/media.ts` — import + background enrichment.
@@ -60,10 +60,8 @@ standalone media preview, MM:SS ruler, aspect-ratio-aware preview.
 Recently added (this track of work — all on `main`, pushed to github.com/Kngq/Freecut):
 1. **Font selection for text** — `FONT_CATALOG`; `TextClip.fontFamily`; threaded into the preview
    `ctx.font` and the ffmpeg `drawtext fontfile=`. Dropdown in the Inspector text editor.
-2. **Auto-captions (local)** — `electron/main/transcribe.ts`: whisper.cpp (`whisper-cli` from PATH/
-   Homebrew) + a once-downloaded GGML model (`ggml-base.en.bin`) in `userData/whisper/`. ffmpeg
-   extracts 16kHz WAV → `whisper-cli -oj` → parsed segments → `addCaptionClips` adds subtitle-style
-   text clips. UI: MediaBin "Captions" tab (`CaptionsPanel.tsx`). Graceful when binary/model absent.
+2. **Auto-captions (local)**: see "Auto captions (rebuilt)" below. Whisper base via transformers.js
+   in a utilityProcess (`electron/main/captions.ts` + `captionWorker.ts`); no Homebrew/whisper.cpp.
 3. **Top bar cleanup** — removed Split/Freeze/Play/skip; play-pause + skip indicator now lives
    under the preview (`Preview.tsx` `.preview-controls`). Spacebar still toggles play.
 4. **Preview effects/transitions without a clip** — `EffectPreview.tsx` renders a live looping
@@ -518,8 +516,7 @@ See also `frontend.md` (CapCut UI teardown from the same research session, not y
   `.dev-shots/` (gitignored).
 
 ## Known limitations / good next steps
-- **Captions** require `brew install whisper-cpp` (binary not bundled); once installed, the model
-  downloads on first use. Consider bundling `@remotion/install-whisper-cpp` to auto-fetch the binary.
+- **Captions** download the Whisper model (~136 MB) on first use; offline after that.
 - **Background removal** requires `npm i onnxruntime-node` (optional, prebuilt arm64) and is
   CPU-only. It's per-frame (edges can flicker; temporal smoothing is the next refinement). The
   button shows bake progress. The result applies to the clip; put it on an upper track to
@@ -536,3 +533,194 @@ See also `frontend.md` (CapCut UI teardown from the same research session, not y
 ## Git
 - Remote: `https://github.com/Kngq/Freecut.git` (origin). Branch `main`.
 - Working tree should be committed & pushed after each feature chunk.
+
+## Media drop ghost + timeline drag overlays (CapCut look)
+
+Re-extracted CapCut's QML from `libVECreator.dylib` (rcc blobs, zlib) on 2026-11-12. The read was
+`TimeLine/.../MainTimeLineFollowSegments.qml` (ghost) and the `DropArea` in `MainTimeLine.qml`.
+- **Follow ghost** (`src/shared/mediaDrop.ts` `resolveMediaDrop`, tested): one resolver for hover
+  and drop. Video tracks show the ghost at the ripple-insert cut. Audio snaps its start *or* end
+  edge to clip edges, the playhead or 0 within 10 px (CapCut's radius is in C++, unknown).
+  ⌘/Ctrl disables snapping. The drop commits at the ghost's start.
+- **Visuals from the QML**: radius-4 block in the clip colour, an 18 px chip row
+  (14 px chips, 10 px text, 4 px left inset, 8 px gap). Transition ghost = rounded block of
+  transition length centred on the cut, 16×12 icon only when it fits. The playhead turns accent
+  colour when snapped (`cursor.viewModel.adsorbed`). Edge auto-scroll uses a 20 px margin
+  (`autoScrollMargin`).
+- **Inferred, not observed:** the snap guide line through the tracks (CapCut draws it in C++,
+  `kAdsorbLineHeight`). Finder files get no ghost; CapCut draws none either.
+- **Not done:** replace mode (card rotated 8° with a badge, dropping media onto a clip swaps its
+  source). freecut has no replace action yet.
+- Verified with synthetic DragEvents (`.dev-shots/dnd-ghost-*.png`, `dnd-transition.png`). Note:
+  after HMR, import app modules by the `?t=` URL from `performance` entries, or the driver gets a
+  separate module instance.
+
+## Transition blocks on the timeline (CapCut look)
+
+From CapCut's `MainTimeLineSegmentTransition` QML: a transition is its own segment over the cut.
+It is white at 35 % (`Transparency_White_035`) with a faint white border, an 18 px icon centred
+when the block is at least 20 px wide, sits above the clips (z 6/7), and has trim handles.
+- **Drawing only, the model is unchanged** (`src/shared/transitionBlocks.ts`, tested): the
+  transition is still an overlap (right clip starts `d` early), so preview and export are
+  untouched. Clips are drawn inset by d/2 on the transition side so they meet at the overlap's
+  midpoint, and the block covers the overlap. Filmstrip and waveform are cropped to match.
+- **Resize:** edge handles stretch the block symmetrically around the cut, clamped to
+  [0.1 s, shorter clip], with a live readout. It commits on release via `setClipTransition`
+  (one undo step). Clips reflow on release, not during the drag.
+- **Click** selects the owning (right) clip, so the Inspector shows the transition, and
+  highlights the block. The old `⤬` header badge is gone.
+- **Differences from CapCut:** CapCut keeps total length fixed and shows "Repeat frame" masks
+  when a clip lacks handle frames. freecut's overlap model shortens the timeline by `d` instead.
+  The clip trim handles at a cut are covered by the block.
+
+## UI font: TikTok Sans (stands in for CapCut Sans)
+- CapCut's interface font is `CapCut Sans Text` (bundled in `CapCut.app/Contents/Resources/Font/SystemFont/CapCutSansText-*.otf`; QML uses `font.family: "CapCut Sans Text"` / "PingFang SC"). The file has no copyright or license fields, so it is not copied.
+- It matches **TikTok Sans** (SIL OFL 1.1, google/fonts `ofl/tiktoksans`): at opsz 12 / wght 400 it has the same x-height (529) and cap height (705), covers the same 574 characters, and has the same stylistic sets ("Account spoofing", "Tailed l", "Slashed zero"…). Advance widths differ by about 19/1000 em on average (older spacing).
+- Bundled as `src/renderer/assets/fonts/TikTokSans.ttf` (variable: opsz/wdth/wght/slnt) with `TikTokSans-OFL.txt`. `@font-face` + `font-optical-sizing: auto` in `styles.css`; buttons/inputs/selects now `font-family: inherit`.
+- Not changed: text-on-video fonts (Preview/export font catalog). CapCut's default caption font `en.ttf` is Metropolis (Chris Simpson; open licensed), which could be added to the text font catalog.
+
+## Auto captions (rebuilt)
+- **Engine**: Whisper base (multilingual, `onnx-community/whisper-base_timestamped`) via `@huggingface/transformers` 3.7.6 on onnxruntime-node (prebuilt binaries, no install scripts needed). Runs in an Electron `utilityProcess` (`electron/main/captionWorker.ts`, a second vite main entry) so inference never blocks the main process. Model (~136 MB) downloads once to `<userData>/models/transformers`, then offline. Replaced the old whisper.cpp/Homebrew path (`transcribe.ts`, deleted).
+- **Windowing**: transformers.js's built-in `chunk_length_s` drops most words when `return_timestamps: 'word'` (measured: 21 of ~280 words on 111 s). The worker windows audio itself (≤28 s, cut at the quietest 20 ms frame in the last 4 s) and offsets times; near-silent windows are skipped (Whisper hallucinates on silence). Measured ~25× real time on Apple silicon.
+- **Flow**: panel → `captionSources(project, scope)` (main track / all tracks / selected clip; skips muted, frozen, reversed) → main extracts each clip's trimmed source range as 16 kHz f32le with ffmpeg → worker → words in source time → `captionLinesFor` maps through trim + speed curve (`timelineTimeForSource`) and `segmentWords` groups lines (sentence end, ≥0.6 s pause, max chars from canvas width/font size, ≤3.5 s, clause commas once half full; 0.4 s hold) → `setAutoCaptions` (one undo step).
+- **Data**: captions are ordinary `TextClip`s on a "Captions" text track, marked by `caption: { words }` (clip-local word times, for future word-highlight templates). `TextClip.stroke {color,width}` added: preview `strokeText` (2× width, round joins) and export `drawtext borderw/bordercolor`.
+- **Style**: `CaptionStyle` (font, size, colour, bold, outline, y) in `src/shared/captions.ts`. Default = bold white, black outline, y 0.8. Regenerating replaces all captions but keeps the current captions' style. Inspector: Outline controls for any text clip; "Apply style to all captions" on a caption. Templates should be presets of `CaptionStyle` (+ word-highlight options using `caption.words`).
+- **UI**: MediaBin tab row now wheel-scrolls with edge fades (Captions was hidden past the edge of a narrow panel).
+- **Verified**: in app with a `say`-generated talk clip: first run (incl. download) <28 s, cached run ~10 s for 16 s audio, 12 well-timed lines; apply-to-all, regenerate-keeps-style, undo. Export frame shows the outline. Tests: `captions.test.ts` (9), outline in `ffmpegGraph.test.ts`.
+- **Known gaps**: editing a caption's text doesn't re-time its `words`; export ignores `bold` (pre-existing: drawtext uses the regular face); no line wrapping (lines are kept short instead); no SRT import/export yet; the model download has no checksum/pinning beyond the HF repo.
+
+## Caption timing, templates and sliders (from CapCut)
+**Sources (all local, read-only; nothing copied into the repo):** CapCut projects in `~/Movies/CapCut/User Data/Projects/com.lveditor.draft/*/draft_info.json` (captions live in nested `materials.drafts[].draft`; segments point at `text_templates` → `text_info_resources[].text_material_id` → `texts[]` with `words {start_time[], end_time[], text[]}` in ms, clip-relative); caption template + animation packages in the sandbox effect cache `~/Library/Containers/com.lemon.lvoverseas/Data/Movies/CapCut/User Data/Cache/effect/<id>/<md5>/`; the Trending list from a cached panel response in `Cache/ressdk_db/*/rp.db` (`http_cache`, panel `heycan`, category_key `trending`) inspected via a `.backup` snapshot (REA `inspect_sqlite_database` + sqlite3). Four uncached Trending templates were fetched from the item_urls in that listing into the session scratchpad only. CapCut's auto-captions are cloud ASR (`Cache/recognize` holds only uploaded m4a).
+
+**Timing (how CapCut adjusts it):**
+- Stored word times are raw ASR (40 ms grid). The caption engine (`modules/CaptionModule.lua`, `initCaptionInfo`) computes *packed* times before animating: overlaps pushed apart; a gap ≤ `timeSpace` (1000 ms) is shared `extendRight`/`extendLeft` (default 0.5/0.5; per-word templates call `splitPage(0, 1)` so a word stays lit until the next starts); a longer gap is only bridged towards its midpoint. Ported as `packWordTimes` (src/shared/captions.ts).
+- Measured on 53 real captions: caption starts on its first word, ends on its last (no hold), boundaries on the 30 fps grid, 76% touch the next caption, max exactly 3.0 s, median 8 words / 40 chars (max 12 / 55).
+- freecut now: line boundaries use packed times (lines meet across short pauses), `maxDuration` 3 s, snapped to `canvas.fps`; the 0.4 s hold is gone.
+
+**Templates** (`src/shared/captionTemplates.ts`, 8 + Basic): Word by word (逐字出现), Outline pop (边框弹出), Word pop (逐字弹出黑体), Pink slider (cc粉色滑块), Word box (新_逐词边框), Cartoon pop (逐字弹出综艺体), Bold shadow (弹出-粗体阴影), Karaoke (useLetterColor family). Each comment lists the CapCut values used (content.json fill/keyword colour/canvas box/`max_units_per_line`/`keyframe_params`, effectStyle stroke+shadow stacks, animation Lua). Animation curves: `pop` = 3512850 `exp(-7t)·sin((t−0.075)·2π/0.3)+1`; `overshoot` = 3512851 AE keyframes 0→120% (f6.45)→100% (f12.1); `squash` = 160095677 scaleX 0.8→1 in 0.1 s. Page split = `wordCountPerPageLimit(n)`.
+- Data: `TextClip.look` (`TextLook`: uppercase, weight, shadows[], pageBox, highlight {color | box, slide, scale}, unreadOpacity, wordsPerPage, wordsPerLine, animation, templateId). Store: `applyCaptionTemplate`, `setAutoCaptions(lines, templateId)`, apply-to-all copies `look`.
+- Fonts: ZY Resolve/Elegant-Black/Steady/Vigour, Obelix Pro, Poffen are proprietary → bundled open stand-ins (Montserrat, Archivo incl. 125% width, Anton, Luckiest Guy, Fredoka, Rubik) in `src/renderer/assets/fonts` with licences; added to `FONT_CATALOG` (fontFile '' = bundled).
+- Renderer: `src/renderer/textRender.ts` (`drawTextClip`/`drawTextLayer`) draws all text for the preview AND export. Edited caption text keeps word timing if the word count is unchanged, else spreads words evenly.
+- Gallery: `CaptionTemplateTile` animates each template with the real renderer.
+
+**Export:** text is no longer drawtext. Before ffmpeg, the renderer bakes every text clip into a transparent PNG sequence (`src/renderer/export/textOverlay.ts` → IPC `overlay:*` → `electron/main/textOverlay.ts`, blank/identical frames hard-linked) and `buildFfmpegPlan(project, { textOverlay })` overlays it (`overlay=0:0:format=auto:eof_action=pass`). Fixes bold/bundled fonts/outline parity. 16 s clip: bake ~2.5–5 s. drawtext remains as the fallback when no overlay is passed.
+
+**Sliders** (`src/renderer/components/Slider.tsx`): CapCut `VESlider`/`VESpinBoxSlider` (rcc 00287/00289): 2 px track at 12% white, solid white fill (CSS var `--p`), 8×12 white pill handle; optional editable value box with unit. All range inputs use it; the speed panel's dashed duration slider keeps its triangle marker.
+
+**Verified:** tests 126 pass (`captions.test.ts`, `textRender.test.ts`, overlay plan test); in app: gallery renders all templates with bundled fonts; Word box preview vs exported frame match; Word pop export shows the spring animation; Basic export is bold.
+**Gaps:** CapCut's AI keyword highlighting (is_key) isn't reproduced (we highlight the spoken word); Flashback III (emoji + multicolour) not rebuilt; templates 0/2/5's own caption animations (7131927521469141505, 7314634238265922050) weren't available, so their motion is approximated.
+
+## Clip context menu, multi-select, colour space, UI polish (2026-11-18)
+
+- **Right-click menu on timeline clips** (`components/ClipContextMenu.tsx`), laid out like CapCut 9.5's
+  `MainTimelineMenuModel::popupVideoSegmentMenu` (v2): Copy · Cut · Copy/paste attributes ▸ · Delete · Edit ▸
+  (Freeze, Reverse, Mirror, Rotate, Crop) — Transcript · Separate audio · Extract audio — Group/Ungroup ·
+  Create compound clip — Export selected clips · More clip actions ▸ (Deactivate/Activate, Replace clip,
+  Trim start/end to playhead, Open file location). Right-click on empty timeline = Paste (as in CapCut).
+  Submenus flip/shift to stay on screen.
+- **CapCut UI reference** extracted with REA from /Applications/CapCut.app (Qt6/QML, strings in
+  `Contents/Resources/po/en.po`, theme tokens in libFusionUI) plus `capcutcopy/User Data` (draft JSON).
+  Used: accent #00C1CD (Brand_Primary_Default), control fill #3B3B3B, menu surface #303030 r8 p6 rows 28,
+  text Pattern buttons in Bold/Underline/Italic order with a darker (#070709) active well, Case = Uppercase /
+  Lowercase / Title case, colour-space options (CapCut has 709 SDR, 2020 SDR, 2100 HLG, 2100 PQ; we ship 709).
+  Pure logic lives in `src/shared/clipOps.ts` (unit-tested in `clipOps.test.ts`); the store wraps it
+  with undo + selection; async actions (render, dialogs, IPC) are in `src/renderer/clipActions.ts`.
+- **Multi-select**: Cmd/Ctrl/Shift-click toggles; `selectedClipIds` + `selectionOf()` (the list is only
+  trusted while it contains the primary `selectedClipId`). Groups (`clip.groupId`) select/copy/delete as a unit.
+- **Shortcuts**: ⌘C/⌘X/⌘V, ⌥⌘C/⌥⌘V attributes, ⌘G / ⇧⌘G group, ⌥G compound, V deactivate, Q/W trim
+  start/end to playhead, ⇧F freeze, ⌫ deletes the whole selection.
+- **Deactivated clips** (`clip.disabled`): preview and export skip them; on the main roll the slot renders black
+  so later clips keep their timing. Timeline draws them dimmed + hatched.
+- **Crop** (`MediaClip.crop`, fractions of the source): crop dialog (`CropDialog.tsx`) with Free/Original/9:16/
+  16:9/1:1/4:5/4:3; export applies `crop` on the trimmed frames before fit/scale; preview draws the same source rect.
+  Verified pixel-exact against the source.
+- **Export selected / compound clip**: render the project with every other clip deactivated, trimmed to the
+  selection's span (`planToFfmpegArgs(..., range)`). Compound clips are saved under `<userData>/Compound clips/`
+  and replace the selection with one clip (undo restores the originals). Extract audio writes
+  `<userData>/Extracted audio/<name> (audio).m4a`.
+- **Colour space**: project setting `canvas.colorSpace` ('rec709', the default and only option, in the Project
+  inspector). Probe records each video's colour tags (`asset.color`; mediainfo cache bumped to v2). Export converts
+  HDR HLG/PQ (e.g. iPhone) with zscale + Hable tone-map, tagged SD/Rec.2020-SDR with `colorspace`, does the final
+  RGB→YUV with the Rec.709 matrix (swscale defaults to 601, which shifted text/overlay colours) and tags the file
+  bt709/tv. Verified: Rec.709 source round-trips exactly, red text overlay stays (253,0,0); Hable picked over
+  mobius/reinhard/clip by comparing real iPhone HLG frames with macOS Quick Look's own SDR rendering.
+- **Text**: Pattern row (B / I / U toggles) and Case row (AA / aa / Aa, click again for "as typed"):
+  `TextClip.italic/underline/textCase`, rendered by `textRender.ts` (so preview and export match).
+- **UI**: dropdowns are filled boxes without an outline (custom chevron); property rows put the label on the left
+  (`.field-row.prop-row`); clip names are regular-weight white; video clips use one blue (`--track-video`) for
+  border, name strip and body; selection is a white frame. The transform keyframe editor was removed (old projects
+  still play their keyframes; touching a transform slider replaces them with the static value).
+- **Auto-captions "no speech" fix**: transformers.js 3.7.6 crops Whisper cross-attention with `num_frames`
+  at 100 fps instead of 50, so word timestamps collapse to ~29.98 s on some >15 s clips (e.g. iPhone HLG
+  IMG_1328) and were dropped as past the clip end. `captionWorker.ts` patches `_extract_token_timestamps`
+  (halves num_frames like the Python impl), falls back to phrase timestamps when alignment still looks broken,
+  and clamps word times. Known: "Detect automatically" still defaults to English inside transformers.js.
+- Known pre-existing failure: `scripts/testExportKeyframes.ts` (keyframed overlay fade pixel check) fails with
+  or without the new Rec.709 output step.
+- **Timeline row order (CapCut layout)**: `src/shared/trackOrder.ts` `displayTracks()` shows text/caption
+  tracks at the top (last-drawn highest), overlay video tracks, the main video track, then audio. Display only:
+  `project.tracks` order still drives compositing. Text rows are compact 36px strips (`TEXT_ROW_HEIGHT`).
+- **HDR thumbnails/proxies**: filmstrip + bin thumbnails (`thumbnails.ts`) and transcoded preview proxies
+  (`proxy.ts`) now run the same `colorConversionFilters()` as export (HLG/PQ tone-mapped to Rec. 709; the
+  zscale input tags are explicit so it works after a resize). Thumbnails decode to RGB with the Rec. 709 matrix.
+  Cache versions bumped (thumbnails v3, proxies v2), so existing projects regenerate them on open.
+
+## Inspector restructure, Animations, speed-curve graph, motion blur (2026-11-20)
+- **Inspector**: no "Inspector" title or Start/Duration row. Video tab = collapsible sections (`Section` in Inspector.tsx, open state in localStorage `freecut.inspectorSections`): Transform (Scale, Position X/Y in px from centre with Y up, Rotate −180…180), Blend (Opacity), Motion blur, Audio, Effects, Remove background, Transition. Text clips use the same Transform/Blend sections. Fonts stepped down ~1px app-wide; rows have more vertical spacing.
+- **Animations** (`src/shared/animations.ts`, tests): In / Out / Combo presets, sampled into ordinary transform keyframes by `animatedTransform()`. The preview uses `animatedTransformCached`; export bakes them in `buildFfmpegPlan`. Easing comes from CapCut's cached AE animation exports (`Cache/effect/*/LumiExportData.lua`): cubic-bezier (0.33,0,0,1) for scale, (1,0,0,1) for opacity. Out presets are In presets played backwards. Combo replaces In/Out. Store: `setClipAnimations`. Smoke test: `scripts/testExportAnimations.ts`.
+- **Export geometry change**: main-track transforms are now an overlay onto a black canvas (`applyCanvasTransform`), not a scale≥1 crop. Scale below 1 and off-canvas positions now match the preview. Rotation works at any angle and keeps the full rotated bounding box. Overlay clips rotate with transparent corners. Order for the main track: rotate/flip → transform → effects. `piecewiseLinearExpr` drops collinear keyframes.
+- **Speed**: the Velocity effects tab, the "3 uses" badge and the fake Smooth slow-mo row are removed. The Curve tab is a draggable log-scale graph (0.1x–4x) with CapCut presets (Montage, Hero, Bullet, Jump cut, Flash in/out). Control points are stored in `speedCurvePoints`, sampled into 16 constant-speed `speedKeyframes` (`src/shared/speedCurve.ts`).
+- **Motion blur** (`electron/main/motionBlur.ts`, `src/shared/motionBlur.ts`, `MotionBlurSection.tsx`): CapCut-style offline bake (Blur, Blend, Direction, Times). Optical flow via `minterpolate` at ≤432 px across parallel segments, then `tmix`, then a motion-masked merge at full resolution. Stored as `sourceOverride` kind `motionBlur`, cached in `Cache/motionblur/`. Runs at about 1.6× real time for 1080p.
+
+## Filters (2026-11-21)
+- CapCut's filters are LUTs downloaded from its server on demand. They are not in CapCut.app or the user-data copy, and the names don't appear in the app, so REA can't extract them. The user chose original look-alikes instead.
+- `src/shared/filters.ts` defines 15 grades in 4 categories (Featured: Clear II, Shadow, Umber, September sunset; Life: Taro, Light Green, Grey Orange, Gold Ivory, Fresh Lime; Retro: VHS; Movies: Blue Grey, Sicily, Dune 1, Love City, Bright Summer).
+  - Each grade is a colour function plus optional sharpen / soften / grain / vignette, and has its own default intensity (Umber 40, Blue Grey 25).
+  - `buildLut` turns a grade into a 33³ LUT with the intensity mixed in; the preview and export both use that same table.
+- **Preview:** `src/renderer/filterRenderer.ts` is a WebGL2 pass using a 3D texture with trilinear sampling. It grades the clip's own pixels before they're placed on the canvas.
+- **Export:** `clipFilterChain` in ffmpegGraph does an RGB round-trip with the 709 matrix in both directions, then `lut3d` (trilinear), then unsharp / gblur / noise / vignette. The plan now carries `files` (the .cube LUTs), which export.ts writes to `<userData>/Cache/luts`.
+- **UI:** the left Filters tab (`FiltersPanel.tsx`) shows tiles graded on the selected clip's frame. Inspector → Video → Filter has an intensity slider and a remove button. Copy/paste attributes now carries the filter and animations. Store action: `setClipFilter`.
+- **Colour fixes found along the way:**
+  - Still images were converted to YUV with the 601 matrix; they now use 709.
+  - The final output scale now states `in_color_matrix=bt709`.
+  - The `freecut-media://` protocol sends `Access-Control-Allow-Origin: *`, and media elements load with `crossOrigin=anonymous`. Without both, the dev renderer can't read frames back for WebGL or canvas.
+- **Test:** `scripts/testExportFilters.ts` checks each exported colour against the preview LUT; all 15 are within 6/255.
+
+## Preview black flashes (2026-11-22)
+
+Reversed clips and speed curves flashed black in the **preview** (export was always clean; `scripts/testExportNoBlackFrames.ts` checks 10 reverse/curve/split/freeze cases frame by frame).
+
+Cause: a `<video>` has no drawable frame while seeking or before its first decode (readyState < 2), and the render loop simply skipped drawing, leaving black. Reverse playback is pure seeking; curves were seek-driven too; and every re-seek aborted the previous one, so frames rarely arrived.
+
+Fixes in `Preview.tsx`:
+- `frameFor()`: every good frame is snapshotted per clip (≤1280px, 16-entry LRU); the snapshot is drawn while the element is seeking/not ready, falling back to the latest held frame of the same asset. Also covers scrubbing, cuts between split pieces, freeze frames, proxy/src swaps and MediaBin preview.
+- `syncMediaElement`: never seeks while a seek is in flight; seek threshold is ~half a frame (was 0.12s, which also made paused frame-stepping skip).
+- Speed curves free-run at the current segment's rate (`clipSpeedAt` in shared/types.ts) instead of seeking.
+- Reversed clips keep the element paused (seek-only); their audio is silent in preview (export uses areverse).
+- Clips starting within 1.5s are preloaded and parked on their first frame.
+
+Measured in the app (1080p, GOP 250): reversed 43% → 0% black frames, curve 7% → 0%; cuts, freeze, scrubbing 0%. Reverse preview runs ~16 new frames/s on long-GOP sources (seek-bound).
+
+## Renamed to anycut; packaging and releases (2026-11-22)
+
+- **Name:** user-facing strings, identifiers, localStorage keys, the media scheme (`anycut-media://`), the skill (`run-anycut`) and the env vars (`ANYCUT_DEBUG_PORT`) are all renamed. The repo folder and the `.fcproj` project extension are unchanged.
+- **Migrations:**
+  - Main: on first launch, `appData/freecut-editor` is moved to `appData/anycut`.
+  - Renderer: `src/renderer/migrateStorage.ts` copies `freecut.*` localStorage keys to `anycut.*`.
+- **Icons:** built from the user's mark.
+  - `build/icon.png`: macOS grid with shadow.
+  - `build/icon.icns`, `build/icon.ico`, `build/icon-full.png` (Linux).
+  - `src/renderer/assets/logo.png`: Home sidebar and toolbar.
+  - `public/favicon.png`.
+- **Packaging (electron-builder, `build` key in package.json):**
+  - ffmpeg / ffprobe / onnxruntime-node / sharp are `asarUnpack`ed.
+  - `electron/main/binaries.ts` rewrites their paths to `app.asar.unpacked`. Use it instead of importing ffmpeg-static or ffprobe-static directly.
+  - Only the target `${platform}/${arch}` ffprobe and onnxruntime binaries are packed (platform-level `files` lists replace the root list, which pulled in capcutcopy/ and made a 2.7 GB DMG).
+  - macOS builds are ad-hoc signed (`identity: "-"`, hardenedRuntime off), not notarized.
+- **Releases:** `.github/workflows/release.yml` triggers on a `v*` tag or a manual run.
+  - Build jobs: macos-14 (arm64), macos-15-intel (x64), windows-latest, ubuntu-22.04.
+  - A final publish job attaches fixed-name installers to the GitHub Release; the README links to `releases/latest/download/<file>`.
+- **Verification:**
+  - A local arm64 DMG builds (204 MB).
+  - The packaged app was launched with `ANYCUT_SHOW_INACTIVE=1` (shows the window inactive, for agent smoke tests) over CDP. Probe, export (reverse + filter) and the background-removal runtime all work.
+  - Captions were not exercised in the packaged build.

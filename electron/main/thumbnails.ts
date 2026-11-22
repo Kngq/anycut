@@ -2,8 +2,10 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
-import ffmpegPath from 'ffmpeg-static'
+import { ffmpegPath } from './binaries'
 import type { ThumbnailCover } from '@shared/ipc'
+import { colorConversionFilters } from '@shared/ffmpegGraph'
+import { probeMedia } from './probe'
 import { cacheKey, dedupe, entryPath, fileExists, readJsonEntry, stampSource, touchEntry, writeFileAtomic, writeMeta } from './cache'
 
 /**
@@ -42,26 +44,31 @@ export async function ensureVideoCover(filePath: string, duration?: number): Pro
       await writeMeta('thumbnails', key, src)
       return cover
     } catch (err) {
-      console.error('[freecut] thumbnail sprite generation failed for', filePath, err)
+      console.error('[anycut] thumbnail sprite generation failed for', filePath, err)
       return null
     }
   })
 }
 
 async function buildSprite(filePath: string, outPath: string, duration: number): Promise<ThumbnailCover> {
-  const work = await fs.mkdtemp(path.join(os.tmpdir(), 'freecut-thumb-'))
+  const work = await fs.mkdtemp(path.join(os.tmpdir(), 'anycut-thumb-'))
   try {
     const span = Math.max(duration, 0.1)
     // Sample at the centre of each of FRAME_COUNT equal slices; never seek past the end.
     const times = Array.from({ length: FRAME_COUNT }, (_, i) => Math.min(((i + 0.5) / FRAME_COUNT) * span, Math.max(span - 0.05, 0)))
     const framePaths = times.map((_, i) => path.join(work, `f${String(i).padStart(3, '0')}.jpg`))
+    // Same colour handling as export: HDR (HLG/PQ, e.g. iPhone) is tone-mapped to Rec. 709 so the
+    // filmstrip and bin thumbnail aren't washed out, and the final RGB conversion uses the Rec. 709
+    // matrix explicitly (left alone, swscale decodes with Rec. 601 and shifts colours).
+    const color = (await probeMedia(filePath))?.color
+    const frameFilter = `scale=-2:${FRAME_HEIGHT},${colorConversionFilters(color)}scale=in_color_matrix=bt709:in_range=tv,format=rgb24`
 
     // Grab frames a few at a time. Each grab seeks before the input, so it's a near-instant
     // keyframe jump + one decoded frame.
     for (let i = 0; i < times.length; i += PARALLEL_SEEKS) {
       await Promise.all(
         times.slice(i, i + PARALLEL_SEEKS).map((t, j) =>
-          runFfmpeg(['-y', '-ss', t.toFixed(3), '-i', filePath, '-frames:v', '1', '-vf', `scale=-2:${FRAME_HEIGHT}`, '-q:v', '4', framePaths[i + j]]).catch(
+          runFfmpeg(['-y', '-ss', t.toFixed(3), '-i', filePath, '-frames:v', '1', '-vf', frameFilter, '-q:v', '4', framePaths[i + j]]).catch(
             () => undefined // a seek past a short file's last keyframe can fail; filled below
           )
         )

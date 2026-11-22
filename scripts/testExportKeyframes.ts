@@ -5,7 +5,7 @@ import ffmpegPath from 'ffmpeg-static'
 import { buildFfmpegPlan, planToFfmpegArgs } from '../src/shared/ffmpegGraph'
 import { createEmptyProject, defaultTransform, type MediaAsset, type MediaClip, type Clip } from '../src/shared/types'
 
-const WORKDIR = process.env.FREECUT_TEST_DIR || '/private/tmp/claude-501/-Users-kng-projects-freecut/993c10e2-d160-482e-8f31-fca3d9b87e21/scratchpad/export-test-keyframes'
+const WORKDIR = process.env.ANYCUT_TEST_DIR || '/private/tmp/claude-501/-Users-kng-projects-anycut/993c10e2-d160-482e-8f31-fca3d9b87e21/scratchpad/export-test-keyframes'
 fs.mkdirSync(WORKDIR, { recursive: true })
 
 function run(args: string[], label: string) {

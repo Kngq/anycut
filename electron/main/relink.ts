@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 /**
- * Missing-media detection + relink. Like CapCut, freecut references media by absolute path and
+ * Missing-media detection + relink. Like CapCut, anycut references media by absolute path and
  * never copies it into the project, so a moved/renamed/unplugged source makes an asset go
  * "offline". On project open the renderer asks which asset paths no longer exist. The user then
  * locates ONE file, and the rest are searched for by filename in that same folder (and one level

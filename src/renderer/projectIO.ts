@@ -8,7 +8,7 @@ import { refreshAsset } from './media'
  * Single place for loading/saving projects so every entry point (Home, Open…, Recents, Save,
  * Save As) gets the same behavior:
  *  - warn when the main file was corrupt and the `.bak` was used,
- *  - warn when another freecut process already has the project open (advisory lock),
+ *  - warn when another anycut process already has the project open (advisory lock),
  *  - detect offline media (moved/renamed/unplugged sources) and flag those assets,
  *  - re-derive proxies/filmstrips/waveforms in the background (cache-backed, near-instant).
  */
@@ -22,7 +22,7 @@ export function loadOpenedProject(opened: OpenedProject): void {
     toast('info', `"${opened.project.name}" couldn't be read, so its last backup (.bak) was opened instead.`)
   }
   if (opened.lockedBy !== undefined) {
-    toast('error', `This project is already open in another freecut window (process ${opened.lockedBy}). Saving from both will overwrite each other's changes.`)
+    toast('error', `This project is already open in another anycut window (process ${opened.lockedBy}). Saving from both will overwrite each other's changes.`)
   }
   void checkMedia()
 }

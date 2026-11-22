@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  clipSpeedAt,
   clipSpeedSegments,
   defaultTransform,
   effectiveDuration,
@@ -154,5 +155,28 @@ describe('interpolateTransform', () => {
       ]
     }
     expect(interpolateTransform(t, 1)).toEqual({ x: 0.5, y: 0.5, scale: 1.5, opacity: 0.5 })
+  })
+})
+
+describe('applyTextCase', () => {
+  it('upper / lower / title / none', async () => {
+    const { applyTextCase } = await import('./types')
+    expect(applyTextCase('hello World', 'upper')).toBe('HELLO WORLD')
+    expect(applyTextCase('Hello WORLD', 'lower')).toBe('hello world')
+    expect(applyTextCase("i can't BELIEVE it's (really) true-ish 'quoted'", 'title')).toBe("I Can't Believe It's (Really) True-Ish 'Quoted'")
+    expect(applyTextCase('As Typed', undefined)).toBe('As Typed')
+  })
+})
+
+describe('clipSpeedAt', () => {
+  it('is the flat speed without a curve', () => {
+    expect(clipSpeedAt(makeClip({ speed: 2 }), 1)).toBe(2)
+  })
+
+  it('follows the curve segment playing at that timeline time', () => {
+    // [0,5) at 1x = timeline 0..5, [5,10) at 2x = timeline 5..7.5
+    const clip = makeClip({ speedKeyframes: [{ time: 0, speed: 1 }, { time: 5, speed: 2 }] })
+    expect(clipSpeedAt(clip, 2)).toBe(1)
+    expect(clipSpeedAt(clip, 6)).toBe(2)
   })
 })

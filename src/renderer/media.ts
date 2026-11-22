@@ -4,7 +4,7 @@ import { useLayoutStore } from './state/layoutStore'
 import { useProjectStore } from './state/projectStore'
 
 /** MIME type used when dragging an already-imported asset from the media bin. */
-export const ASSET_DRAG_MIME = 'application/x-freecut-asset'
+export const ASSET_DRAG_MIME = 'application/x-anycut-asset'
 
 function basename(p: string): string {
   return p.split(/[/\\]/).pop() ?? p
@@ -77,6 +77,7 @@ export async function importAssets(paths: string[]): Promise<ImportResult> {
       width: probe.width,
       height: probe.height,
       hasAudio: probe.hasAudio,
+      color: probe.color,
       cover
     }
     assets.push(asset)
@@ -99,7 +100,8 @@ export async function refreshAsset(asset: MediaAsset): Promise<void> {
     duration: asset.kind === 'image' ? asset.duration : probe.duration,
     width: probe.width ?? asset.width,
     height: probe.height ?? asset.height,
-    hasAudio: probe.hasAudio
+    hasAudio: probe.hasAudio,
+    color: probe.color
   })
   await enrichAsset(asset, probe)
 }

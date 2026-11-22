@@ -7,7 +7,7 @@ import { effectCatalogEntry, TRANSITION_CATALOG, type ClipEffectType, type Proje
  * canvas view-model's dragEnter/dragPositionChanged/dragDrop). Pure and unit-tested.
  *
  * Not modeled yet: CapCut also lets an effect dropped in EMPTY track space become its own effect
- * segment that applies to everything below it. freecut has no effect tracks, so that's a rejection
+ * segment that applies to everything below it. anycut has no effect tracks, so that's a rejection
  * with an explanation for now.
  */
 
@@ -79,8 +79,8 @@ export function resolveDrop(
 /** MIME types marking an effect/transition drag. The payload itself can't be read during
  *  `dragover` (browsers only expose the types until drop), so the card also records it in
  *  `activeDragPayload` (renderer) for live hover feedback; the drop reads the JSON data. */
-export const EFFECT_DRAG_MIME = 'application/x-freecut-effect'
-export const TRANSITION_DRAG_MIME = 'application/x-freecut-transition'
+export const EFFECT_DRAG_MIME = 'application/x-anycut-effect'
+export const TRANSITION_DRAG_MIME = 'application/x-anycut-transition'
 
 export function parseDragPayload(mime: string, json: string): DragPayload | null {
   try {

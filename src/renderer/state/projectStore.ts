@@ -1,7 +1,13 @@
 import { create } from 'zustand'
 import { v4 as uuid } from 'uuid'
+import { captionStyleOf, defaultCaptionStyle, type CaptionLine } from '@shared/captions'
+import { captionTemplate, templateStyle } from '@shared/captionTemplates'
+import * as ops from '@shared/clipOps'
+import { normalizeCurvePoints, sampleSpeedCurve } from '@shared/speedCurve'
+import type { ClipAttributes, ClipClipboard } from '@shared/clipOps'
 import {
   createEffect,
+  isFullCrop,
   createEmptyProject,
   defaultTransform,
   effectiveDuration,
@@ -10,11 +16,15 @@ import {
   type Clip,
   type ClipEffect,
   type ClipEffectType,
+  type ClipCrop,
   type ClipTransform,
+  type ColorSpaceId,
   type MediaAsset,
   type MediaClip,
   type Project,
   type SpeedKeyframe,
+  type SpeedCurvePoint,
+  type TextClip,
   type Track,
   type TrackType,
   type Transition,
@@ -36,6 +46,12 @@ interface ProjectState {
   /** Transient: an effect the Inspector should reveal (set by clicking a clip's effect badge).
    *  `nonce` makes repeat clicks on the same effect re-trigger the scroll. */
   effectFocus: { clipId: string; effectId: string; nonce: number } | null
+  /** Multi-selection (Cmd/Shift-click, groups). Read it through selectionOf(): it's only valid
+   *  while it contains `selectedClipId`, which stays the primary (Inspector) clip. */
+  selectedClipIds: string[]
+  /** Copy/Cut clipboard and the "Copy attributes" clipboard. Session-only. */
+  clipboard: ClipClipboard | null
+  attributeClipboard: ClipAttributes | null
   playhead: number
   isPlaying: boolean
   pxPerSecond: number
@@ -68,10 +84,14 @@ interface ProjectState {
   /** On video tracks the clip is appended unless `insertAtStart` is set, in which case it's placed at `start`. */
   addMediaClipToTrack: (trackId: string, asset: MediaAsset, start: number, options?: { insertAtStart?: boolean }) => void
   addTextClipToTrack: (trackId: string, start: number) => void
-  /** Adds a batch of caption text clips (from auto-transcription) to the first text track, each
-   *  positioned at its segment start with the segment's duration. Styled small + bottom-centered
-   *  like burned-in subtitles. */
-  addCaptionClips: (segments: { start: number; end: number; text: string }[]) => void
+  /** Replaces every auto-caption with `lines`, on the captions text track (the one already
+   *  holding captions, else a new "Captions" track). New captions keep the existing captions'
+   *  style if there are any, else the default. One undo step. */
+  setAutoCaptions: (lines: CaptionLine[], templateId?: string) => void
+  /** Restyles every caption with a template ('basic' = the plain default). One undo step. */
+  applyCaptionTemplate: (templateId: string) => void
+  /** Copies one caption's look (font, size, colour, bold, outline, height) to every caption. */
+  applyCaptionStyleToAll: (fromClipId: string) => void
   addTrack: (type: TrackType) => void
 
   /** Free positioning: only valid for audio/text tracks. */
@@ -88,6 +108,13 @@ interface ProjectState {
   /** Replaces the whole speed-curve keyframe list; undefined disables the curve (falls back
    *  to the clip's flat `speed`). Points are sorted, and clamped to [trimIn,trimOut]/[0.1,4]. */
   setClipSpeedKeyframes: (clipId: string, keyframes: SpeedKeyframe[] | undefined) => void
+  /** Speed > Curve graph: stores the control points + preset id and writes `speedKeyframes`
+   *  sampled from the smooth curve through them (so playback/export match the graph).
+   *  undefined clears the curve. `live` skips the undo step (pointer drags call
+   *  recordUndoPoint once on release instead). */
+  setClipSpeedCurve: (clipId: string, points: SpeedCurvePoint[] | undefined, preset?: string, opts?: { live?: boolean }) => void
+  /** Records `before` as one undo step if the project has changed since (used after a live drag). */
+  recordUndoPoint: (before: Project) => void
   setClipReversed: (clipId: string, reversed: boolean) => void
   /** Replaces a clip's transform (position/scale/opacity, optionally keyframed). Works for
    *  both media and text clips since `transform` lives on ClipBase. */
@@ -115,11 +142,36 @@ interface ProjectState {
   updateClipEffectParam: (clipId: string, effectId: string, key: string, value: number) => void
   updateTextClip: (clipId: string, patch: Record<string, unknown>) => void
   updateMediaClipProps: (clipId: string, patch: Partial<Pick<MediaClip, 'volume' | 'muted' | 'changeAudioPitch'>>) => void
+  /** Animation tab: replaces the clip's In/Out/Combo presets. `record` = add an undo step
+   *  (off while a duration slider is being dragged). */
+  setClipAnimations: (clipId: string, animations: MediaClip['animations'], record?: boolean) => void
+  /** Filters: sets or clears (undefined) the clip's filter. `record` = add an undo step (off
+   *  while the intensity slider is dragged). */
+  setClipFilter: (clipId: string, filter: MediaClip['filter'], record?: boolean) => void
   /** Points one clip at a baked stand-in (e.g. background removed), or clears it (undefined).
    *  The bin asset is untouched. Undoable. */
   setClipSourceOverride: (clipId: string, override: MediaClip['sourceOverride']) => void
 
   selectClip: (clipId: string | null) => void
+  /** Cmd/Shift-click: adds or removes a clip (and its group) from the selection. */
+  toggleClipSelection: (clipId: string) => void
+  copySelection: () => void
+  cutSelection: () => void
+  paste: () => void
+  copyAttributes: (clipId: string) => void
+  pasteAttributesToSelection: () => void
+  deleteSelection: () => void
+  setSelectionDisabled: (disabled: boolean) => void
+  groupSelection: () => void
+  ungroupSelection: () => void
+  separateAudio: (clipId: string) => void
+  replaceClipMedia: (clipId: string, asset: MediaAsset) => void
+  /** CapCut's Trim start / Trim end: cut the clip's head or tail off at the playhead. */
+  trimClipToPlayhead: (clipId: string, edge: 'start' | 'end') => void
+  setClipCrop: (clipId: string, crop: ClipCrop | undefined) => void
+  /** Swaps `clipIds` for one clip of the already-rendered compound `asset` (added to the bin). */
+  applyCompound: (clipIds: string[], asset: MediaAsset) => void
+  setColorSpace: (id: ColorSpaceId) => void
   /** Selects the clip and asks the Inspector to reveal one of its effects. */
   focusEffect: (clipId: string, effectId: string) => void
   /** Sets (or clears, with null) the asset previewed standalone in the Preview panel. */
@@ -178,6 +230,15 @@ export function canInsertFreezeFrame(project: Project, playhead: number, clipId:
   const { clip } = found
   if (clip.kind !== 'media' || clip.frozen) return false
   return playhead > clip.start + 0.05 && playhead < clip.start + clip.duration - 0.05
+}
+
+/** The effective selection: the multi-select list when it still includes the primary clip,
+ *  else just the primary (many actions set only selectedClipId). Ids that no longer exist are
+ *  dropped. */
+export function selectionOf(s: Pick<ProjectState, 'project' | 'selectedClipId' | 'selectedClipIds'>): string[] {
+  if (!s.selectedClipId) return []
+  const ids = s.selectedClipIds.includes(s.selectedClipId) ? s.selectedClipIds : [s.selectedClipId]
+  return ids.filter((id) => findClip(s.project, id))
 }
 
 function touch(project: Project): Project {
@@ -239,16 +300,18 @@ function splitMediaClipHalves(clip: MediaClip, firstDuration: number): { first: 
     duration: secondDuration,
     speed,
     speedKeyframes: undefined,
+    speedCurvePoints: undefined,
+    speedCurvePreset: undefined,
     transitionIn: undefined
   }
   if (clip.reversed) {
     return {
-      first: { ...clip, duration: firstDuration, trimIn: splitSource, trimOut: clip.trimOut, speed, speedKeyframes: undefined },
+      first: { ...clip, duration: firstDuration, trimIn: splitSource, trimOut: clip.trimOut, speed, speedKeyframes: undefined, speedCurvePoints: undefined, speedCurvePreset: undefined },
       second: { ...secondBase, trimIn: clip.trimIn, trimOut: splitSource }
     }
   }
   return {
-    first: { ...clip, duration: firstDuration, trimOut: splitSource, speed, speedKeyframes: undefined },
+    first: { ...clip, duration: firstDuration, trimOut: splitSource, speed, speedKeyframes: undefined, speedCurvePoints: undefined, speedCurvePreset: undefined },
     second: { ...secondBase, trimIn: splitSource, trimOut: clip.trimOut }
   }
 }
@@ -268,7 +331,7 @@ function recordPast(s: { project: Project; past: Project[] }): { past: Project[]
  *  the project past it snaps the timeline to minimum zoom (and thus the minute-scale ruler). */
 const LONG_TIMELINE_SECONDS = 60
 
-export const useProjectStore = create<ProjectState>((set) => ({
+export const useProjectStore = create<ProjectState>((set, get) => ({
   project: createEmptyProject('Untitled'),
   filePath: null,
   dirty: false,
@@ -276,6 +339,9 @@ export const useProjectStore = create<ProjectState>((set) => ({
   previewAssetId: null,
   missingAssetIds: [],
   effectFocus: null,
+  selectedClipIds: [],
+  clipboard: null,
+  attributeClipboard: null,
   playhead: 0,
   isPlaying: false,
   pxPerSecond: 60,
@@ -427,27 +493,103 @@ export const useProjectStore = create<ProjectState>((set) => ({
       return { project, dirty: true, selectedClipId: clip.id, ...recordPast(s) }
     }),
 
-  addCaptionClips: (segments) =>
+  setAutoCaptions: (lines, templateId) =>
     set((s) => {
-      const textTrack = s.project.tracks.find((t) => t.type === 'text')
-      if (!textTrack || segments.length === 0) return {}
-      // Subtitle styling: small-ish font anchored near the bottom-center of the canvas.
-      const captionTransform = { ...defaultTransform(), y: 0.86 }
-      const newClips: Clip[] = segments.map((seg) => ({
+      const isCaption = (c: Clip) => c.kind === 'text' && !!c.caption
+      const existing = s.project.tracks.flatMap((t) => t.clips).find(isCaption) as TextClip | undefined
+      const tpl = captionTemplate(templateId)
+      const style = existing
+        ? captionStyleOf(existing)
+        : tpl
+          ? { ...templateStyle(tpl, s.project.canvas), y: defaultCaptionStyle(s.project.canvas).y }
+          : defaultCaptionStyle(s.project.canvas)
+      let tracks = s.project.tracks
+      let captionTrack = tracks.find((t) => t.type === 'text' && t.clips.some(isCaption))
+      if (!captionTrack) {
+        captionTrack = { id: uuid(), type: 'text', name: 'Captions', clips: [], muted: false, hidden: false }
+        tracks = [...tracks, captionTrack]
+      }
+      const trackId = captionTrack.id
+      const newClips: TextClip[] = lines.map((line) => ({
         id: uuid(),
-        kind: 'text' as const,
-        trackId: textTrack.id,
-        start: Math.max(0, seg.start),
-        duration: Math.max(0.3, seg.end - seg.start),
-        text: seg.text,
-        fontSize: 42,
-        color: 'white',
-        bold: true,
-        fontFamily: 'sans',
-        transform: captionTransform
+        kind: 'text',
+        trackId,
+        start: Math.max(0, line.start),
+        duration: Math.max(0.2, line.end - line.start),
+        text: line.text,
+        fontSize: style.fontSize,
+        color: style.color,
+        bold: style.bold,
+        italic: style.italic,
+        underline: style.underline,
+        textCase: style.textCase,
+        fontFamily: style.fontFamily,
+        ...(style.stroke ? { stroke: { ...style.stroke } } : {}),
+        ...(style.look ? { look: structuredClone(style.look) } : {}),
+        transform: { ...defaultTransform(), y: style.y },
+        caption: { words: line.words.map((w) => ({ text: w.text, start: w.start - line.start, end: w.end - line.start })) }
       }))
-      const project = updateTrack(s.project, textTrack.id, (t) => ({ ...t, clips: [...t.clips, ...newClips] }))
-      return { project, dirty: true, ...recordPast(s) }
+      tracks = tracks.map((t) => {
+        const kept = t.clips.filter((c) => !isCaption(c))
+        return t.id === trackId ? { ...t, clips: [...kept, ...newClips] } : kept.length === t.clips.length ? t : { ...t, clips: kept }
+      })
+      const selectedGone = s.selectedClipId && !tracks.some((t) => t.clips.some((c) => c.id === s.selectedClipId))
+      return { project: touch({ ...s.project, tracks }), dirty: true, ...(selectedGone ? { selectedClipId: null } : {}), ...recordPast(s) }
+    }),
+
+  applyCaptionStyleToAll: (fromClipId) =>
+    set((s) => {
+      const from = findClip(s.project, fromClipId)?.clip
+      if (!from || from.kind !== 'text' || !from.caption) return {}
+      const style = captionStyleOf(from)
+      const tracks = s.project.tracks.map((t) => ({
+        ...t,
+        clips: t.clips.map((c): Clip => {
+          if (c.kind !== 'text' || !c.caption || c.id === fromClipId) return c
+          const { stroke: _drop, look: _dropLook, ...rest } = c
+          return {
+            ...rest,
+            fontSize: style.fontSize,
+            color: style.color,
+            bold: style.bold,
+            italic: style.italic,
+            underline: style.underline,
+            textCase: style.textCase,
+            fontFamily: style.fontFamily,
+            ...(style.stroke ? { stroke: { ...style.stroke } } : {}),
+            ...(style.look ? { look: structuredClone(style.look) } : {}),
+            transform: { ...c.transform, y: style.y }
+          }
+        })
+      }))
+      return { project: touch({ ...s.project, tracks }), dirty: true, ...recordPast(s) }
+    }),
+
+  applyCaptionTemplate: (templateId) =>
+    set((s) => {
+      const tpl = captionTemplate(templateId)
+      const base = defaultCaptionStyle(s.project.canvas)
+      const style = tpl ? templateStyle(tpl, s.project.canvas) : { fontSize: base.fontSize, color: base.color, bold: base.bold, fontFamily: base.fontFamily ?? 'sans', stroke: base.stroke, look: undefined }
+      let changed = false
+      const tracks = s.project.tracks.map((t) => ({
+        ...t,
+        clips: t.clips.map((c): Clip => {
+          if (c.kind !== 'text' || !c.caption) return c
+          changed = true
+          const { stroke: _s, look: _l, ...rest } = c
+          return {
+            ...rest,
+            fontSize: style.fontSize,
+            color: style.color,
+            bold: style.bold,
+            fontFamily: style.fontFamily,
+            ...(style.stroke ? { stroke: { ...style.stroke } } : {}),
+            ...(style.look ? { look: structuredClone(style.look) } : {})
+          }
+        })
+      }))
+      if (!changed) return {}
+      return { project: touch({ ...s.project, tracks }), dirty: true, ...recordPast(s) }
     }),
 
   addTrack: (type) =>
@@ -766,6 +908,29 @@ export const useProjectStore = create<ProjectState>((set) => ({
       return { project, dirty: true }
     }),
 
+  setClipSpeedCurve: (clipId, points, preset, opts) =>
+    set((s) => {
+      const found = findClip(s.project, clipId)
+      if (!found || found.clip.kind !== 'media') return {}
+      const clip = found.clip as MediaClip
+      const normalized = points ? normalizeCurvePoints(points) : undefined
+      const patch: Partial<MediaClip> = normalized
+        ? {
+            speedCurvePoints: normalized,
+            speedCurvePreset: preset ?? 'custom',
+            speedKeyframes: sampleSpeedCurve(normalized, clip.trimIn, clip.trimOut)
+          }
+        : { speedCurvePoints: undefined, speedCurvePreset: undefined, speedKeyframes: undefined }
+      const project = updateTrack(s.project, found.track.id, (t) => {
+        const withPatch = { ...t, clips: t.clips.map((c) => (c.id === clipId ? ({ ...c, ...patch } as Clip) : c)) }
+        return repackVideoTrack(withPatch)
+      })
+      return { project, dirty: true, ...(opts?.live ? {} : recordPast(s)) }
+    }),
+
+  recordUndoPoint: (before) =>
+    set((s) => (s.project === before ? {} : { past: [...s.past, before].slice(-HISTORY_LIMIT), future: [] })),
+
   setClipSpeedKeyframes: (clipId, keyframes) =>
     set((s) => {
       const found = findClip(s.project, clipId)
@@ -780,7 +945,11 @@ export const useProjectStore = create<ProjectState>((set) => ({
             }))
         : undefined
       const project = updateTrack(s.project, found.track.id, (t) => {
-        const withPatch = { ...t, clips: t.clips.map((c) => (c.id === clipId ? { ...c, speedKeyframes: sanitized } : c)) }
+        // A raw keyframe list replaces any graph control points (they'd no longer match).
+        const withPatch = {
+          ...t,
+          clips: t.clips.map((c) => (c.id === clipId ? { ...c, speedKeyframes: sanitized, speedCurvePoints: undefined, speedCurvePreset: undefined } : c))
+        }
         return repackVideoTrack(withPatch)
       })
       return { project, dirty: true }
@@ -870,6 +1039,29 @@ export const useProjectStore = create<ProjectState>((set) => ({
       return { project, dirty: true }
     }),
 
+  setClipFilter: (clipId, filter, record = true) =>
+    set((s) => {
+      const found = findClip(s.project, clipId)
+      if (!found || found.clip.kind !== 'media') return {}
+      const project = updateTrack(s.project, found.track.id, (t) => ({
+        ...t,
+        clips: t.clips.map((c) => (c.id === clipId && c.kind === 'media' ? { ...c, filter } : c))
+      }))
+      return { project, dirty: true, ...(record ? recordPast(s) : {}) }
+    }),
+
+  setClipAnimations: (clipId, animations, record = true) =>
+    set((s) => {
+      const found = findClip(s.project, clipId)
+      if (!found || found.clip.kind !== 'media') return {}
+      const empty = !animations || (!animations.in && !animations.out && !animations.combo)
+      const project = updateTrack(s.project, found.track.id, (t) => ({
+        ...t,
+        clips: t.clips.map((c) => (c.id === clipId && c.kind === 'media' ? { ...c, animations: empty ? undefined : animations } : c))
+      }))
+      return { project, dirty: true, ...(record ? recordPast(s) : {}) }
+    }),
+
   setClipSourceOverride: (clipId, override) =>
     set((s) => {
       const found = findClip(s.project, clipId)
@@ -883,7 +1075,127 @@ export const useProjectStore = create<ProjectState>((set) => ({
 
   focusEffect: (clipId, effectId) =>
     set({ selectedClipId: clipId, previewAssetId: null, effectFocus: { clipId, effectId, nonce: Date.now() } }),
-  selectClip: (clipId) => set((s) => ({ selectedClipId: clipId, previewAssetId: clipId ? null : s.previewAssetId })),
+  selectClip: (clipId) =>
+    set((s) => ({
+      selectedClipId: clipId,
+      selectedClipIds: clipId ? ops.expandGroups(s.project, [clipId]) : [],
+      previewAssetId: clipId ? null : s.previewAssetId
+    })),
+
+  toggleClipSelection: (clipId) =>
+    set((s) => {
+      const current = selectionOf(s)
+      const unit = ops.expandGroups(s.project, [clipId])
+      if (current.includes(clipId)) {
+        const rest = current.filter((id) => !unit.includes(id))
+        return { selectedClipIds: rest, selectedClipId: rest.length ? (rest.includes(s.selectedClipId ?? '') ? s.selectedClipId : rest[rest.length - 1]) : null }
+      }
+      return { selectedClipIds: [...new Set([...current, ...unit])], selectedClipId: clipId, previewAssetId: null }
+    }),
+
+  copySelection: () => set((s) => ({ clipboard: ops.copyClips(s.project, selectionOf(s)) ?? s.clipboard })),
+
+  cutSelection: () => {
+    get().copySelection()
+    get().deleteSelection()
+  },
+
+  paste: () =>
+    set((s) => {
+      if (!s.clipboard) return {}
+      const { project, ids } = ops.pasteClips(s.project, s.clipboard, s.playhead, uuid, repackVideoTrack)
+      if (ids.length === 0) return {}
+      return { project, dirty: true, selectedClipId: ids[0], selectedClipIds: ids, ...recordPast(s) }
+    }),
+
+  copyAttributes: (clipId) =>
+    set((s) => {
+      const found = findClip(s.project, clipId)
+      return found ? { attributeClipboard: ops.copyAttributes(found.clip) } : {}
+    }),
+
+  pasteAttributesToSelection: () =>
+    set((s) => {
+      const ids = selectionOf(s)
+      if (!s.attributeClipboard || ids.length === 0) return {}
+      return { project: ops.pasteAttributes(s.project, ids, s.attributeClipboard, repackVideoTrack), dirty: true, ...recordPast(s) }
+    }),
+
+  deleteSelection: () =>
+    set((s) => {
+      const ids = selectionOf(s)
+      if (ids.length === 0) return {}
+      return { project: ops.removeClips(s.project, ids, repackVideoTrack), dirty: true, selectedClipId: null, selectedClipIds: [], ...recordPast(s) }
+    }),
+
+  setSelectionDisabled: (disabled) =>
+    set((s) => {
+      const ids = selectionOf(s)
+      if (ids.length === 0) return {}
+      return { project: ops.setClipsDisabled(s.project, ids, disabled), dirty: true, ...recordPast(s) }
+    }),
+
+  groupSelection: () =>
+    set((s) => {
+      const ids = selectionOf(s)
+      if (ids.length < 2) return {}
+      return { project: ops.groupClips(s.project, ids, uuid), dirty: true, ...recordPast(s) }
+    }),
+
+  ungroupSelection: () =>
+    set((s) => {
+      const ids = selectionOf(s)
+      if (ids.length === 0) return {}
+      return { project: ops.ungroupClips(s.project, ids), dirty: true, ...recordPast(s) }
+    }),
+
+  separateAudio: (clipId) =>
+    set((s) => {
+      const res = ops.separateAudio(s.project, clipId, uuid)
+      if (!res) return {}
+      return { project: res.project, dirty: true, ...recordPast(s) }
+    }),
+
+  replaceClipMedia: (clipId, asset) =>
+    set((s) => {
+      const withAsset = s.project.assets.some((a) => a.id === asset.id) ? s.project : { ...s.project, assets: [...s.project.assets, asset] }
+      const project = ops.replaceClipMedia(withAsset, clipId, asset, repackVideoTrack)
+      return project ? { project: touch(project), dirty: true, ...recordPast(s) } : {}
+    }),
+
+  trimClipToPlayhead: (clipId, edge) => {
+    const s = get()
+    const found = findClip(s.project, clipId)
+    if (!found) return
+    const t = s.playhead
+    if (t <= found.clip.start + 0.05 || t >= found.clip.start + found.clip.duration - 0.05) return
+    const before = s.project
+    get().trimClip(clipId, edge, t)
+    // trimClip is the live drag action (no undo step per mouse move); record one here.
+    if (get().project !== before) set((cur) => ({ past: [...cur.past, before].slice(-HISTORY_LIMIT), future: [] }))
+  },
+
+  setClipCrop: (clipId, crop) =>
+    set((s) => {
+      const found = findClip(s.project, clipId)
+      if (!found || found.clip.kind !== 'media') return {}
+      const project = updateTrack(s.project, found.track.id, (t) => ({
+        ...t,
+        clips: t.clips.map((c) => (c.id === clipId ? ({ ...c, crop: crop && !isFullCrop(crop) ? crop : undefined } as Clip) : c))
+      }))
+      return { project, dirty: true, ...recordPast(s) }
+    }),
+
+  applyCompound: (clipIds, asset) =>
+    set((s) => {
+      const withAsset = { ...s.project, assets: [...s.project.assets, asset] }
+      const res = ops.replaceWithCompound(withAsset, clipIds, asset, uuid, repackVideoTrack)
+      if (!res) return {}
+      return { project: touch(res.project), dirty: true, selectedClipId: res.clipId, selectedClipIds: [res.clipId], ...recordPast(s) }
+    }),
+
+  setColorSpace: (id) =>
+    set((s) => (s.project.canvas.colorSpace === id ? {} : { project: touch({ ...s.project, canvas: { ...s.project.canvas, colorSpace: id } }), dirty: true, ...recordPast(s) })),
   setPreviewAsset: (assetId) => set({ previewAssetId: assetId, isPlaying: false }),
   setCanvasSize: (width, height) =>
     set((s) => ({

@@ -1,12 +1,10 @@
 import { spawn } from 'node:child_process'
 import path from 'node:path'
-// @ts-expect-error - no types published
-import ffprobePkg from 'ffprobe-static'
+import { ffprobePath } from './binaries'
 import type { ProbeResult } from '@shared/ipc'
 import { SUPPORTED_EXTENSIONS } from '@shared/types'
 import { cacheKey, entryPath, readJsonEntry, stampSource, writeFileAtomic, writeMeta } from './cache'
 
-const ffprobePath: string = (ffprobePkg as { path: string }).path
 
 const VIDEO_EXT = new Set<string>(SUPPORTED_EXTENSIONS.video)
 const AUDIO_EXT = new Set<string>(SUPPORTED_EXTENSIONS.audio)
@@ -30,6 +28,16 @@ export async function probeMedia(filePath: string): Promise<ProbeResult | null> 
     await writeMeta('mediainfo', key, src)
   }
   return result
+}
+
+/** ffprobe's colour tags, skipping 'unknown'/'reserved' placeholders. */
+function colorTags(stream: Record<string, unknown>): ProbeResult['color'] {
+  const tag = (k: string) => {
+    const v = stream[k]
+    return typeof v === 'string' && v && v !== 'unknown' && v !== 'reserved' ? v : undefined
+  }
+  const color = { primaries: tag('color_primaries'), transfer: tag('color_transfer'), matrix: tag('color_space'), range: tag('color_range') }
+  return Object.values(color).some(Boolean) ? color : undefined
 }
 
 function probeUncached(filePath: string): Promise<ProbeResult | null> {
@@ -72,7 +80,8 @@ function probeUncached(filePath: string): Promise<ProbeResult | null> {
           height: videoStream ? Number(videoStream.height) : undefined,
           hasAudio: Boolean(audioStream),
           videoCodec: videoStream ? String(videoStream.codec_name ?? '') : undefined,
-          audioCodec: audioStream ? String(audioStream.codec_name ?? '') : undefined
+          audioCodec: audioStream ? String(audioStream.codec_name ?? '') : undefined,
+          color: videoStream ? colorTags(videoStream) : undefined
         })
       } catch {
         resolve(null)

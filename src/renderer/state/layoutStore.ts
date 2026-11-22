@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-const STORAGE_KEY = 'freecut.layout'
+const STORAGE_KEY = 'anycut.layout'
 
 /** CapCut-style timeline row density: short (name-only bar), default (current look), tall. */
 export type TrackHeightMode = 'short' | 'default' | 'tall'
@@ -100,3 +100,13 @@ function pick(s: LayoutState): LayoutPrefs {
     useProxies: s.useProxies
   }
 }
+
+/** One-shot requests from elsewhere in the UI to open a media-bin tab (e.g. the clip menu's
+ *  "Transcript" opens Captions scoped to the selected clip). Session-only. */
+export const useBinRequest = create<{
+  request: { tab: string; captionScope?: 'selected'; nonce: number } | null
+  open: (tab: string, captionScope?: 'selected') => void
+}>((set) => ({
+  request: null,
+  open: (tab, captionScope) => set({ request: { tab, captionScope, nonce: Date.now() } })
+}))

@@ -1,19 +1,30 @@
 import { spawn } from 'node:child_process'
-import ffmpegPath from 'ffmpeg-static'
+import fs from 'node:fs/promises'
+import path from 'node:path'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { app } from 'electron'
+import { ffmpegPath } from './binaries'
 import { buildFfmpegPlan, planToFfmpegArgs } from '@shared/ffmpegGraph'
 import { projectDuration, type Project } from '@shared/types'
 import type { ExportProgress, ExportResult } from '@shared/ipc'
+import type { TextOverlayInput } from '@shared/ffmpegGraph'
 
 export function exportProject(
   project: Project,
   outputPath: string,
-  onProgress: (p: ExportProgress) => void
+  onProgress: (p: ExportProgress) => void,
+  textOverlay?: TextOverlayInput,
+  range?: { start: number; end: number }
 ): Promise<ExportResult> {
-  const totalDuration = Math.max(projectDuration(project), 0.1)
+  const totalDuration = Math.max(range ? range.end - range.start : projectDuration(project), 0.1)
 
   let plan
   try {
-    plan = buildFfmpegPlan(project)
+    plan = buildFfmpegPlan(project, { textOverlay, lutDir: path.join(app.getPath('userData'), 'Cache', 'luts') })
+    for (const f of plan.files ?? []) {
+      mkdirSync(path.dirname(f.path), { recursive: true })
+      writeFileSync(f.path, f.content)
+    }
   } catch (err) {
     return Promise.resolve({ ok: false, error: err instanceof Error ? err.message : String(err) })
   }
@@ -23,7 +34,7 @@ export function exportProject(
   }
   const resolvedFfmpegPath: string = ffmpegPath
 
-  const args = planToFfmpegArgs(plan, outputPath)
+  const args = planToFfmpegArgs(plan, outputPath, range)
 
   return new Promise((resolve) => {
     onProgress({ ratio: 0, message: 'Starting ffmpeg…' })
@@ -56,4 +67,26 @@ export function exportProject(
       }
     })
   })
+}
+
+/**
+ * "Extract audio": copies a file's audio into `<userData>/Extracted audio/<name> (audio).m4a`
+ * (AAC; stream-copied when it already is AAC, so it's instant and lossless). Returns the path.
+ */
+export async function extractAudio(inputPath: string): Promise<{ ok: boolean; outputPath?: string; error?: string }> {
+  if (!ffmpegPath) return { ok: false, error: 'ffmpeg not available' }
+  const dir = path.join(app.getPath('userData'), 'Extracted audio')
+  await fs.mkdir(dir, { recursive: true })
+  const base = path.basename(inputPath, path.extname(inputPath))
+  let out = path.join(dir, `${base} (audio).m4a`)
+  for (let i = 2; await fs.access(out).then(() => true, () => false); i++) out = path.join(dir, `${base} (audio ${i}).m4a`)
+  const run = (codecArgs: string[]) =>
+    new Promise<boolean>((resolve) => {
+      const proc = spawn(ffmpegPath as string, ['-y', '-v', 'error', '-i', inputPath, '-vn', '-map', '0:a:0', ...codecArgs, out])
+      proc.on('error', () => resolve(false))
+      proc.on('close', (code) => resolve(code === 0))
+    })
+  if ((await run(['-c:a', 'copy'])) || (await run(['-c:a', 'aac', '-b:a', '256k']))) return { ok: true, outputPath: out }
+  await fs.unlink(out).catch(() => {})
+  return { ok: false, error: "the file has no audio track ffmpeg can read" }
 }

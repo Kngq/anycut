@@ -1,4 +1,5 @@
-import type { MediaAsset, Project, ThumbnailCover, Waveform } from './types'
+import type { CaptionWord, MediaAsset, MotionBlurSettings, Project, ThumbnailCover, Waveform } from './types'
+import type { CaptionSource } from './captions'
 export type { ThumbnailCover, Waveform } from './types'
 
 export interface ProbeResult {
@@ -9,6 +10,8 @@ export interface ProbeResult {
   hasAudio: boolean
   videoCodec?: string
   audioCodec?: string
+  /** Video colour tags (ffprobe names); absent fields were untagged. */
+  color?: { primaries?: string; transfer?: string; matrix?: string; range?: string }
 }
 
 export interface ExportProgress {
@@ -23,7 +26,7 @@ export interface ExportResult {
 }
 
 /** A project read from disk. `recoveredFromBackup` = the main file was unreadable and the `.bak`
- *  from the previous save was used. `lockedBy` = PID of another freecut process that has it open. */
+ *  from the previous save was used. `lockedBy` = PID of another anycut process that has it open. */
 export interface OpenedProject {
   path: string
   project: Project
@@ -31,7 +34,7 @@ export interface OpenedProject {
   lockedBy?: number
 }
 
-export type CacheKind = 'mediainfo' | 'thumbnails' | 'waveforms' | 'proxies' | 'remux' | 'mattes'
+export type CacheKind = 'mediainfo' | 'thumbnails' | 'waveforms' | 'proxies' | 'remux' | 'mattes' | 'motionblur'
 
 export interface CacheUsage {
   root: string
@@ -39,27 +42,44 @@ export interface CacheUsage {
   totalBytes: number
 }
 
-/** One transcribed caption line, in timeline seconds. */
-export interface CaptionSegment {
-  start: number
-  end: number
-  text: string
-}
-
-/** Whether local captioning can run right now (whisper.cpp binary + downloaded model). */
+/** Local auto-captions: whether the speech model is already on disk (else the first run fetches it). */
 export interface CaptionStatus {
-  binaryAvailable: boolean
-  binaryPath?: string
   modelDownloaded: boolean
   modelName: string
-  installHint?: string
+  modelSizeMB: number
 }
 
-/** Whether local background removal can run (ONNX runtime + downloaded matting model). */
+/** Progress of a caption run, per clip. `ratio` is within the current phase. */
+export interface CaptionProgress {
+  phase: 'extract' | 'download' | 'transcribe'
+  ratio: number
+  clipIndex: number
+  clipCount: number
+}
+
+/** Words per clip, in SOURCE seconds. */
+export interface CaptionResult {
+  ok: boolean
+  results?: { clipId: string; words: CaptionWord[] }[]
+  error?: string
+  cancelled?: boolean
+}
+
+/** Matting models for background removal: 'person' (MODNet) or 'general' (ISNet). */
+export type MattingModelId = 'person' | 'general'
+
+export interface MattingModelInfo {
+  id: MattingModelId
+  label: string
+  description: string
+  sizeMB: number
+  downloaded: boolean
+}
+
+/** Whether local background removal can run (ONNX runtime + which matting models are downloaded). */
 export interface BackgroundStatus {
   runtimeAvailable: boolean
-  modelDownloaded: boolean
-  modelName: string
+  models: MattingModelInfo[]
   installHint?: string
 }
 
@@ -71,7 +91,17 @@ export interface BackgroundResult {
   error?: string
 }
 
-export interface FreecutApi {
+export interface MotionBlurResult {
+  ok: boolean
+  outputPath?: string
+  /** Browser-playable copy (VP9+alpha WebM) when the bake has alpha (ProRes 4444 output). */
+  previewPath?: string
+  hasAlpha?: boolean
+  error?: string
+  cancelled?: boolean
+}
+
+export interface AnycutApi {
   openMediaDialog(): Promise<string[]>
   probeMedia(path: string): Promise<ProbeResult | null>
   /** Chromium can't decode some codecs browsers never had to support (ProRes, DNxHD, etc.) even
@@ -92,7 +122,7 @@ export interface FreecutApi {
   openProjectAtPath(path: string): Promise<OpenedProject | null>
   writeProject(path: string, project: Project): Promise<boolean>
   /** Moves the advisory project lock to `path` (null releases it). Returns another live PID if
-   *  that project is already open in a different freecut process. */
+   *  that project is already open in a different anycut process. */
   lockProject(path: string | null): Promise<number | undefined>
   /** Subset of `paths` that don't exist on disk (offline media). */
   findMissingMedia(paths: string[]): Promise<string[]>
@@ -106,18 +136,36 @@ export interface FreecutApi {
   cleanCache(maxAgeDays: number, recentProjectPaths: string[], openAssetPaths: string[]): Promise<{ removedFiles: number; freedBytes: number }>
   revealCache(): Promise<boolean>
   exportDialog(defaultName: string): Promise<string | null>
-  exportProject(project: Project, outputPath: string): Promise<ExportResult>
+  /** `overlayId`: a baked text overlay (overlayBegin/Frame) to composite instead of drawtext. */
+  /** `range` exports only [start, end) of the timeline. */
+  exportProject(project: Project, outputPath: string, overlayId?: string, range?: { start: number; end: number }): Promise<ExportResult>
+  showInFolder(path: string): Promise<void>
+  compoundPath(): Promise<string>
+  extractAudio(path: string): Promise<{ ok: boolean; outputPath?: string; error?: string }>
+  /** Text overlay bake: the renderer draws text frames with the preview's renderer for export. */
+  overlayBegin(): Promise<string>
+  overlayBlank(id: string, data: Uint8Array): Promise<void>
+  /** PNG bytes, 'blank' (no text this frame) or 'same' (repeat the previous frame). */
+  overlayFrame(id: string, index: number, data: Uint8Array | 'blank' | 'same'): Promise<void>
+  overlayDiscard(id: string): Promise<void>
   onExportProgress(cb: (progress: ExportProgress) => void): () => void
-  /** Local auto-caption (whisper.cpp): status, one-time model download, and transcription. */
+  /** Local auto-captions (Whisper via transformers.js, in a utility process). */
   captionStatus(): Promise<CaptionStatus>
-  downloadCaptionModel(): Promise<{ ok: boolean; error?: string }>
-  transcribeToCaptions(path: string): Promise<{ ok: boolean; segments?: CaptionSegment[]; error?: string }>
+  transcribeClips(sources: CaptionSource[], language: string): Promise<CaptionResult>
+  cancelCaptions(): Promise<void>
+  onCaptionProgress(cb: (p: CaptionProgress) => void): () => void
   /** Local background removal (ONNX matting): status, one-time model download, and processing. */
   backgroundStatus(): Promise<BackgroundStatus>
-  downloadBackgroundModel(): Promise<{ ok: boolean; error?: string }>
-  removeBackground(path: string): Promise<BackgroundResult>
+  /** Progress (0..1) is reported on onBackgroundProgress. */
+  downloadBackgroundModel(model: MattingModelId): Promise<{ ok: boolean; error?: string }>
+  removeBackground(path: string, model: MattingModelId): Promise<BackgroundResult>
   /** Progress (0..1) of the running background-removal bake. Returns an unsubscribe. */
   onBackgroundProgress(cb: (ratio: number) => void): () => void
+  /** Video > Motion blur: bakes `path` (the clip's current source) with optical-flow motion blur.
+   *  Progress (0..1) on onMotionBlurProgress; cancelMotionBlur() stops it (result.cancelled). */
+  motionBlur(path: string, settings: MotionBlurSettings): Promise<MotionBlurResult>
+  cancelMotionBlur(): Promise<void>
+  onMotionBlurProgress(cb: (ratio: number) => void): () => void
   fileUrl(path: string): string
   /** Absolute path of a File from a drag-and-drop (File.path was removed in Electron 32). */
   getPathForFile(file: File): string
@@ -125,6 +173,6 @@ export interface FreecutApi {
 
 declare global {
   interface Window {
-    api: FreecutApi
+    api: AnycutApi
   }
 }

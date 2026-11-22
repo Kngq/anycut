@@ -92,7 +92,7 @@ export function TransitionPreview({ type, size = 72 }: { type: TransitionType; s
       c.fillStyle = '#2b3a67'
       c.fillRect(0, 0, size, size)
       c.fillStyle = '#9fb4ff'
-      c.font = `bold ${size * 0.4}px sans-serif`
+      c.font = `bold ${size * 0.4}px 'TikTok Sans', sans-serif`
       c.textAlign = 'center'
       c.textBaseline = 'middle'
       c.fillText('A', size / 2, size / 2)
@@ -107,7 +107,7 @@ export function TransitionPreview({ type, size = 72 }: { type: TransitionType; s
       c.fillStyle = '#5a3a2b'
       c.fillRect(0, 0, size, size)
       c.fillStyle = '#ffcf9f'
-      c.font = `bold ${size * 0.4}px sans-serif`
+      c.font = `bold ${size * 0.4}px 'TikTok Sans', sans-serif`
       c.textAlign = 'center'
       c.textBaseline = 'middle'
       c.fillText('B', size / 2, size / 2)

@@ -1,4 +1,4 @@
-# How CapCut builds its transitions and effects, and how freecut could rebuild them
+# How CapCut builds its transitions and effects, and how anycut could rebuild them
 
 Sources: the local CapCut desktop install and its download cache
 (`~/Movies/CapCut/User Data/Cache/effect/`, 264 effect packs, about 3.6k shader files), plus
@@ -37,7 +37,7 @@ much we actually saw:
   `resource/video/finger2.mp4`, for example. Light leaks and film burns almost certainly
   work the same way: a video layer composited on top.
 
-**Architecture for freecut:** Preview currently draws with Canvas 2D, and export is an
+**Architecture for anycut:** Preview currently draws with Canvas 2D, and export is an
 ffmpeg `filter_complex` with `xfade` (`src/shared/ffmpegGraph.ts`). To match CapCut, add a
 WebGL2 pass with the signature `(texA, texB, progress, params) -> frame` for transitions and
 `(tex, time, params) -> frame` for effects. Drive `progress` through a cubic-bezier ease.
