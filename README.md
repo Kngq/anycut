@@ -39,6 +39,14 @@ The builds aren't signed with a paid Apple or Microsoft certificate yet, so your
   ```
   Some distros need `libfuse2` for AppImages (`sudo apt install libfuse2`).
 
+### Tip: iPhone videos
+
+iPhones record in HEVC, often in HDR (Dolby Vision). Converting those clips to H.264 first gives better colour and quality in anycut. On a Mac you can do it in Finder:
+
+1. Select the video(s) in Finder, right-click → **Encode Selected Video Files**.
+2. Pick an **H.264** setting (not HEVC or Apple ProRes) at the clip's resolution, e.g. 1080p or 4K.
+3. Click **Continue**. Finder saves the converted copy next to the original; import that copy into anycut.
+
 ## Features
 
 - **Timeline editing:** multi-track video, audio and text; split, trim, copy/paste, group, compound clips, undo/redo.
