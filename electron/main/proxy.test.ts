@@ -22,6 +22,13 @@ describe('planProxy (cheapest way to make a source previewable)', () => {
     expect(planProxy('.mkv', 'h264', 'ac3')).toBe('transcode')
   })
 
+  it('gives heavy (bigger than 1080p) playable video a light preview proxy', () => {
+    expect(planProxy('.MOV', 'hevc', 'aac', 3840, 2160)).toBe('transcode')
+    expect(planProxy('.mov', 'hevc', 'aac', 2160, 3840)).toBe('transcode')
+    expect(planProxy('.mp4', 'h264', 'aac', 1920, 1080)).toBe('none')
+    expect(planProxy('.m4a', undefined, 'aac', 0, 0)).toBe('none')
+  })
+
   it('never proxies still images', () => {
     expect(planProxy('.png')).toBe('none')
     expect(planProxy('.JPG')).toBe('none')

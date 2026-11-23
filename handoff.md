@@ -800,3 +800,11 @@ Measured in the app (1080p, GOP 250): reversed 43% → 0% black frames, curve 7%
     - Split keeps fade-in on the first half and fade-out on the second.
     - Covered by `scripts/testExportFades.ts`.
   - The export finish shows a success toast with "Show in Finder" (toasts gained `success` and an action button).
+
+## Cuts in preview with phone 4K footage (2026-11-22)
+
+- **Change kept:** videos larger than 1080p now get a 720p H.264 preview proxy (`planProxy` takes width/height), and all proxies use `-g 30`. This removed the decoder ramp-up drops after every cut with 4K HEVC (a 0.17 s frame gap plus 5 dropped frames → none) and makes seeking lighter. Export still reads the originals.
+- **Still open:** a clip WITH an audio track freezes on its first frame for ~0.25-0.28 s after a cut, while play() waits for the audio output. Tried without success:
+  - Pre-rolling the next clip early: this fixes the cut, but the frame-delivery behaviour then halves the displayed frame rate for ~1 s, through both `requestVideoFrameCallback` and unseen playback.
+  - Pre-rolling at playbackRate 1/16: the stall moves to the rate change.
+- **Likely real fix:** a WebCodecs decode path, or driving the timeline clock from the active element during playback. Measured with `scratchpad cut*.js` (canvas-hash change counts vs element currentTime).

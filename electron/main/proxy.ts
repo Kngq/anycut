@@ -17,9 +17,14 @@ import { cacheKey, dedupe, entryPath, fileExists, stampSource, touchEntry, write
  * Two tiers, cheapest first (mirrors CapCut's RemuxCache before agencycache):
  *  1. REMUX (`-c copy`, lossless, seconds): playable streams in a container Chromium won't open
  *     (.mkv/.avi with h264/aac). Just re-wraps the existing streams into MP4.
- *  2. TRANSCODE to a 720p H.264 proxy: the codec itself isn't decodable. CapCut defaults its proxies
- *     to 720p too. That's plenty for preview and several times faster to encode than full res.
+ *  2. TRANSCODE to a 720p H.264 proxy: the codec itself isn't decodable, OR the video is bigger
+ *     than 1080p (phone 4K, often HEVC). Chromium decodes those, but each clip start costs a
+ *     decoder ramp-up (frames dropped for ~0.2 s right after every cut, measured with 4K HEVC)
+ *     and scrubbing/reverse are slow. CapCut defaults its proxies to 720p too. That's plenty for
+ *     preview and several times faster to encode than full res.
  */
+/** Above this many pixels on the long side, a playable video still gets a light preview proxy. */
+const HEAVY_LONG_SIDE = 1920
 const SAFE_VIDEO_CODECS = new Set(['h264', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg4', 'theora'])
 const SAFE_AUDIO_CODECS = new Set(['aac', 'mp3', 'opus', 'vorbis', 'pcm_s16le', 'pcm_s24le', 'flac'])
 /** Containers Chromium's media stack opens directly. */
@@ -32,11 +37,12 @@ const PROXY_HEIGHT = 720
 export type ProxyPlan = 'none' | 'remux' | 'transcode'
 
 /** Decides the cheapest way to make a source playable in the preview. Pure; unit-testable. */
-export function planProxy(ext: string, videoCodec?: string, audioCodec?: string): ProxyPlan {
+export function planProxy(ext: string, videoCodec?: string, audioCodec?: string, width?: number, height?: number): ProxyPlan {
   const e = ext.toLowerCase()
   if (IMAGE_EXTS.has(e)) return 'none'
   const codecBad = (videoCodec && !SAFE_VIDEO_CODECS.has(videoCodec)) || (audioCodec && !SAFE_AUDIO_CODECS.has(audioCodec))
   if (codecBad) return 'transcode'
+  if (videoCodec && Math.max(width ?? 0, height ?? 0) > HEAVY_LONG_SIDE) return 'transcode'
   if (!SAFE_CONTAINERS.has(e)) return 'remux'
   return 'none'
 }
@@ -48,7 +54,8 @@ function extOf(p: string): string {
 
 export async function ensurePreviewProxy(filePath: string, videoCodec?: string, audioCodec?: string): Promise<string | null> {
   if (!ffmpegPath) return null
-  const plan = planProxy(extOf(filePath), videoCodec, audioCodec)
+  const info = videoCodec ? await probeMedia(filePath) : null
+  const plan = planProxy(extOf(filePath), videoCodec, audioCodec, info?.width, info?.height)
   if (plan === 'none') return null
 
   const src = await stampSource(filePath)
@@ -90,6 +97,10 @@ async function buildProxy(
           'veryfast',
           '-crf',
           '23',
+          // A keyframe every second (x264's default is ~10 s): seeking, scrubbing and reverse
+          // playback only decode from the nearest keyframe.
+          '-g',
+          '30',
           '-pix_fmt',
           'yuv420p',
           ...REC709_OUTPUT_ARGS,
