@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import Slider from './Slider'
 import { isMainVideoTrack, selectionOf, useProjectStore } from '../state/projectStore'
 import ClipContextMenu from './ClipContextMenu'
@@ -9,7 +9,7 @@ import { resolveDrop, type DragPayload, type DropResolution } from '@shared/drop
 import { clipDrawInsets, resizedTransitionDuration, transitionBlocks, type TransitionBlock } from '@shared/transitionBlocks'
 import { resolveMediaDrop, snapFreeStart, trackForAsset as trackForAssetIn, type MediaDropGhost } from '@shared/mediaDrop'
 import { ASSET_DRAG_MIME, assetsFromPaths, droppedFilePaths, isMediaDrag } from '../media'
-import { activeAssetDragId, activeDragPayload, endAssetDrag, endFxDrag, isFxDrag, readFxPayload } from '../dragPayload'
+import { activeAssetDragId, activeAssetDragIds, activeDragPayload, endAssetDrag, endFxDrag, isFxDrag, readFxPayload } from '../dragPayload'
 import { useToastStore } from '../state/toastStore'
 
 /** Width of the sticky track label column; lanes and the ruler's 0s mark start after it. */
@@ -30,7 +30,27 @@ interface DragState {
   trackRowIds: string[]
   /** Snap to clip edges / the playhead while moving along a free track (⌘/Ctrl turns it off). */
   snap: boolean
+  /** Current pointer Y (client), to pick the target row live. */
+  pointerY: number
+  /** Where the clip was grabbed, from its top-left (px), so the floating copy stays under the cursor. */
+  grabX: number
+  grabY: number
+  clipHeight: number
 }
+
+/** Where a clip being dragged would land (resolved live, drawn as a ghost, committed on release). */
+type ClipDropTarget =
+  | { kind: 'main'; trackId: string; index: number; gapStart: number }
+  | { kind: 'free'; trackId: string; start: number; snapTime: number | null }
+  | { kind: 'newTrack'; start: number; snapTime: number | null }
+  | { kind: 'none' }
+
+/** Trim handles: hit width in px (capped to a third of a short clip so both stay grabbable). */
+const TRIM_HANDLE_PX = 12
+/** Pointer travel (px) before a trim starts, so grabbing an edge never nudges it. */
+const TRIM_DEADZONE_PX = 3
+/** A trimmed edge snaps to clip edges / the playhead within this many px. */
+const TRIM_SNAP_PX = 8
 
 /** Live hover state of an effect/transition drag: what a drop here would do (the ghost). */
 interface FxDropState {
@@ -45,6 +65,8 @@ interface FxDropState {
 interface MediaGhostState extends MediaDropGhost {
   name: string
   kind: 'video' | 'audio'
+  /** Dropping here puts the clip on a new overlay track (it would land on top of another video). */
+  newTrack?: boolean
 }
 
 /** Pointer distance (px) from the timeline's visible edge that starts auto-scrolling during a
@@ -100,7 +122,8 @@ function WaveformCanvas({
   startFrac,
   endFrac,
   visibleStart,
-  visibleEnd
+  visibleEnd,
+  gain = 1
 }: {
   peaks: number[]
   fullWidth: number
@@ -109,6 +132,8 @@ function WaveformCanvas({
   endFrac: number
   visibleStart: number
   visibleEnd: number
+  /** Clip volume: the drawn peaks scale with it (CapCut's waveform grows/shrinks as you drag). */
+  gain?: number
 }) {
   const ref = useRef<HTMLCanvasElement | null>(null)
   const segLeft = Math.max(0, Math.floor(visibleStart))
@@ -136,11 +161,11 @@ function WaveformCanvas({
     for (let x = 0; x < w; x++) {
       const frac = startFrac + ((segLeft + x) / fullWidth) * span
       const idx = Math.min(peaks.length - 1, Math.max(0, Math.floor(frac * peaks.length)))
-      const amp = peaks[idx]
+      const amp = Math.min(1, peaks[idx] * gain)
       const barH = Math.max(1, amp * (h - 2))
       ctx.fillRect(x, mid - barH / 2, 1, barH)
     }
-  }, [peaks, fullWidth, height, startFrac, endFrac, segLeft, segWidth])
+  }, [peaks, fullWidth, height, startFrac, endFrac, segLeft, segWidth, gain])
 
   return <canvas ref={ref} className="clip-waveform" style={{ left: segLeft, width: segWidth, height }} />
 }
@@ -333,6 +358,11 @@ export default function Timeline() {
   const trimClip = useProjectStore((s) => s.trimClip)
   const moveFreeClip = useProjectStore((s) => s.moveFreeClip)
   const reorderVideoClip = useProjectStore((s) => s.reorderVideoClip)
+  const moveClipToNewTrack = useProjectStore((s) => s.moveClipToNewTrack)
+  const addMediaClipToNewTrack = useProjectStore((s) => s.addMediaClipToNewTrack)
+  const setSelection = useProjectStore((s) => s.setSelection)
+  const recordUndoPoint = useProjectStore((s) => s.recordUndoPoint)
+  const updateMediaClipProps = useProjectStore((s) => s.updateMediaClipProps)
   const setZoom = useProjectStore((s) => s.setZoom)
   const addAsset = useProjectStore((s) => s.addAsset)
   const addMediaClipToTrack = useProjectStore((s) => s.addMediaClipToTrack)
@@ -367,6 +397,12 @@ export default function Timeline() {
   const [drag, setDrag] = useState<DragState | null>(null)
   const dragRef = useRef<DragState | null>(null)
   const [trim, setTrim] = useState<TrimState | null>(null)
+  /** The time a trimmed edge is snapped to (drawn as a guide line). */
+  const [trimSnap, setTrimSnap] = useState<number | null>(null)
+  const [volumeDrag, setVolumeDrag] = useState<{ clipId: string } | null>(null)
+  const [fadeDrag, setFadeDrag] = useState<{ clipId: string; which: 'in' | 'out' } | null>(null)
+  /** Marquee rectangle in timeline-body coordinates. */
+  const [marquee, setMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null)
   const [dropTrackId, setDropTrackId] = useState<string | null>(null)
   const [fxDrop, setFxDrop] = useState<FxDropState | null>(null)
   const [mediaGhost, setMediaGhost] = useState<MediaGhostState | null>(null)
@@ -429,7 +465,7 @@ export default function Timeline() {
     const viewRight = el.scrollLeft + el.clientWidth
     if (x > viewRight - 8) el.scrollLeft = x - LABEL_WIDTH - 40
     else if (x < viewLeft) el.scrollLeft = Math.max(0, x - LABEL_WIDTH - (el.clientWidth - LABEL_WIDTH) / 2)
-  }, [playhead, pxPerSecond])
+  }, [playhead]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const duration = useMemo(() => Math.max(projectDuration(project), 10), [project])
   const contentWidth = duration * pxPerSecond + 200
@@ -444,11 +480,38 @@ export default function Timeline() {
   const minPxPerSecond = laneWidth > 0 ? Math.max(1, (laneWidth / 2) / duration) : 10
   const maxPxPerSecond = 400
 
-  // Keep the current zoom at or above the dynamic floor (e.g. after a longer clip is added, or
-  // the panel is resized smaller). Only pushes up, never fights a user zooming in.
+  // Zoom only ever changes by the user's hand: ⌘/Ctrl + scroll (or a trackpad pinch) here, or the
+  // zoom slider. Nothing else (adding clips, resizing) touches it. The time under the pointer
+  // stays put while zooming.
+  const zoomAnchorRef = useRef<{ t: number; offset: number } | null>(null)
   useEffect(() => {
-    if (pxPerSecond < minPxPerSecond) setZoom(minPxPerSecond)
-  }, [minPxPerSecond, pxPerSecond, setZoom])
+    const el = wrapRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return
+      e.preventDefault()
+      const st = useProjectStore.getState()
+      const r = el.getBoundingClientRect()
+      const offset = e.clientX - r.left
+      const t = Math.max(0, (el.scrollLeft + offset - LABEL_WIDTH) / st.pxPerSecond)
+      const floor = Math.min(minZoomRef.current, st.pxPerSecond)
+      const next = Math.min(400, Math.max(floor, st.pxPerSecond * Math.exp(-e.deltaY * 0.01)))
+      if (next === st.pxPerSecond) return
+      zoomAnchorRef.current = { t, offset }
+      setZoom(next)
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [setZoom])
+  const minZoomRef = useRef(minPxPerSecond)
+  minZoomRef.current = minPxPerSecond
+  useLayoutEffect(() => {
+    const a = zoomAnchorRef.current
+    const el = wrapRef.current
+    if (!a || !el) return
+    zoomAnchorRef.current = null
+    el.scrollLeft = Math.max(0, LABEL_WIDTH + a.t * pxPerSecond - a.offset)
+  }, [pxPerSecond])
 
   function timeAt(clientX: number): number {
     const rect = bodyRef.current?.getBoundingClientRect()
@@ -484,7 +547,26 @@ export default function Timeline() {
       playhead: state.playhead,
       snap: !(e.metaKey || e.ctrlKey)
     })
-    return ghost && { ...ghost, name: asset.name, kind: asset.kind === 'audio' ? 'audio' : 'video' }
+    if (!ghost) return null
+    // Several bin items dragged together: the ghost spans all of them (they land back to back).
+    const ids = activeAssetDragIds()
+    if (ids.length > 1) {
+      ghost.duration = ids.reduce((n, id) => {
+        const a = state.project.assets.find((x) => x.id === id)
+        return n + (a ? (a.kind === 'image' ? 5 : a.duration) : 0)
+      }, 0)
+    }
+    const kind: MediaGhostState['kind'] = asset.kind === 'audio' ? 'audio' : 'video'
+    // A video/image over a text row, or on top of another video on an overlay track, goes on a
+    // new overlay track (CapCut adds a track instead of overlapping).
+    const landed = state.project.tracks.find((t) => t.id === ghost.trackId)
+    const overVideoOnOverlay =
+      kind === 'video' &&
+      landed?.type === 'video' &&
+      !isMainVideoTrack(state.project, landed.id) &&
+      landed.clips.some((c) => c.start < ghost.start + ghost.duration - 1e-6 && c.start + c.duration > ghost.start + 1e-6)
+    const newTrack = kind === 'video' && (track.type === 'text' || overVideoOnOverlay)
+    return { ...ghost, name: asset.name, kind, newTrack }
   }
 
   /** One decision point for hover AND drop (CapCut's model): the same resolver result drives
@@ -577,10 +659,28 @@ export default function Timeline() {
 
     // A single bin asset commits exactly where its ghost was drawn (same resolver).
     if (assetId) {
-      endAssetDrag()
+      const ids = activeAssetDragIds()
       const asset = useProjectStore.getState().project.assets.find((a) => a.id === assetId)
       const ghost = asset && resolveAssetAt(e, track, asset)
-      if (asset && ghost) addMediaClipToTrack(ghost.trackId, asset, ghost.start, { insertAtStart: true })
+      endAssetDrag()
+      if (asset && ghost && ids.length > 1) {
+        // Several bin items: back to back from the ghost's start, each on a track that fits it.
+        let cursor = ghost.start
+        for (const id of ids) {
+          const a = useProjectStore.getState().project.assets.find((x) => x.id === id)
+          const target = a && trackForAsset(a, track)
+          if (!a || !target) continue
+          addMediaClipToTrack(target.id, a, cursor, { insertAtStart: true })
+          const st = useProjectStore.getState()
+          const added = st.project.tracks.flatMap((t) => t.clips).find((c) => c.id === st.selectedClipId)
+          if (added) cursor = added.start + added.duration
+        }
+        return
+      }
+      if (asset && ghost) {
+        if (ghost.newTrack) addMediaClipToNewTrack(asset, ghost.start)
+        else addMediaClipToTrack(ghost.trackId, asset, ghost.start, { insertAtStart: true })
+      }
       return
     }
 
@@ -659,16 +759,69 @@ export default function Timeline() {
     window.addEventListener('mouseup', onUp)
   }
 
-  /** Where a clip being dragged along a floating track (overlay video, audio, text) would land:
-   *  its dragged start, snapped like a bin drop. Null for the main video roll (it reorders). */
-  function freeDragPlacement(d: DragState): { start: number; snapTime: number | null } | null {
-    const state = useProjectStore.getState()
-    const source = state.project.tracks.find((t) => t.id === d.sourceTrackId)
+  /** The row under client Y (nearest row centre). */
+  function rowAt(d: { trackRowY: number[]; trackRowIds: string[] }, clientY: number): string | null {
+    let id: string | null = null
+    let best = Infinity
+    d.trackRowY.forEach((y, i) => {
+      const dist = Math.abs(clientY - y)
+      if (dist < best) {
+        best = dist
+        id = d.trackRowIds[i]
+      }
+    })
+    return id
+  }
+
+  /**
+   * Where the clip being dragged would land, resolved live from the pointer (CapCut's model: the
+   * ghost you see is exactly what the drop does).
+   *  - Main video track: an insertion point between its clips; the clips part to show the gap.
+   *  - Overlay video / audio / text: the dragged start, snapped to edges / the playhead.
+   *  - A video dropped on top of another video on an overlay track, or onto a text row, goes on a
+   *    new overlay track instead.
+   */
+  function resolveClipDrag(d: DragState): ClipDropTarget {
+    const st = useProjectStore.getState()
+    const project = st.project
+    const source = project.tracks.find((t) => t.id === d.sourceTrackId)
     const clip = source?.clips.find((c) => c.id === d.clipId)
-    if (!source || !clip || isMainVideoTrack(state.project, source.id)) return null
+    const targetId = rowAt(d, d.pointerY)
+    const target = project.tracks.find((t) => t.id === targetId)
+    if (!source || !clip || !target) return { kind: 'none' }
     const raw = Math.max(0, d.clipStartPx + d.dx) / pxPerSecond
-    if (!d.snap) return { start: raw, snapTime: null }
-    return snapFreeStart(state.project, raw, clip.duration, pxPerSecond, state.playhead, clip.id)
+    const snapped = d.snap ? snapFreeStart(project, raw, clip.duration, pxPerSecond, st.playhead, clip.id) : { start: raw, snapTime: null }
+    if (source.type === 'video') {
+      if (target.type === 'text') return { kind: 'newTrack', start: snapped.start, snapTime: snapped.snapTime }
+      if (target.type !== 'video') return { kind: 'none' }
+      if (isMainVideoTrack(project, target.id)) {
+        const siblings = target.clips.filter((c) => c.id !== d.clipId)
+        const shift = mainRemovalShift(target, d.clipId)
+        let index = siblings.length
+        for (let i = 0; i < siblings.length; i++) {
+          const vs = siblings[i].start - shift(siblings[i])
+          if (raw < vs + siblings[i].duration / 2) {
+            index = i
+            break
+          }
+        }
+        const gapStart = index < siblings.length ? siblings[index].start - shift(siblings[index]) : siblings.reduce((m, c) => Math.max(m, c.start - shift(c) + c.duration), 0)
+        return { kind: 'main', trackId: target.id, index, gapStart }
+      }
+      const end = snapped.start + clip.duration
+      const overlaps = target.clips.some((c) => c.id !== d.clipId && c.start < end - 1e-6 && c.start + c.duration > snapped.start + 1e-6)
+      if (overlaps) return { kind: 'newTrack', start: snapped.start, snapTime: snapped.snapTime }
+      return { kind: 'free', trackId: target.id, start: snapped.start, snapTime: snapped.snapTime }
+    }
+    if (target.type !== source.type) return { kind: 'none' }
+    return { kind: 'free', trackId: target.id, start: snapped.start, snapTime: snapped.snapTime }
+  }
+
+  /** On the main track, how far each clip moves left once `removedId` (being dragged off) leaves. */
+  function mainRemovalShift(track: Track, removedId: string | null): (c: Clip) => number {
+    const removed = removedId ? track.clips.find((c) => c.id === removedId) : undefined
+    if (!removed) return () => 0
+    return (c) => (c.start > removed.start ? removed.duration : 0)
   }
 
   function onClipPointerDown(e: React.MouseEvent, clip: Clip, track: Track) {
@@ -699,14 +852,18 @@ export default function Timeline() {
       dx: 0,
       trackRowY: rows,
       trackRowIds: rowTracks.map((t) => t.id),
-      snap: true
+      snap: true,
+      pointerY: e.clientY,
+      grabX: e.clientX - (e.currentTarget as HTMLElement).getBoundingClientRect().left,
+      grabY: e.clientY - (e.currentTarget as HTMLElement).getBoundingClientRect().top,
+      clipHeight: (e.currentTarget as HTMLElement).getBoundingClientRect().height
     }
     dragRef.current = initial
     setDrag(initial)
 
     function onMove(ev: MouseEvent) {
       if (!dragRef.current) return
-      dragRef.current = { ...dragRef.current, dx: ev.clientX - dragRef.current.pointerStartX, snap: !(ev.metaKey || ev.ctrlKey) }
+      dragRef.current = { ...dragRef.current, dx: ev.clientX - dragRef.current.pointerStartX, pointerY: ev.clientY, snap: !(ev.metaKey || ev.ctrlKey) }
       setDrag(dragRef.current)
     }
     function onUp(ev: MouseEvent) {
@@ -718,63 +875,165 @@ export default function Timeline() {
       if (!d) return
       // A plain click shouldn't count as a move (it would mark the project dirty for nothing).
       if (Math.abs(ev.clientX - d.pointerStartX) < 3 && Math.abs(ev.clientY - d.pointerStartY) < 3) return
-
-      const newLeftPx = Math.max(0, d.clipStartPx + (ev.clientX - d.pointerStartX))
-      const newStart = newLeftPx / pxPerSecond
-      const placed = freeDragPlacement({ ...d, dx: ev.clientX - d.pointerStartX, snap: !(ev.metaKey || ev.ctrlKey) })
-
-      let targetTrackId = d.sourceTrackId
-      let bestDist = Infinity
-      d.trackRowY.forEach((y, i) => {
-        const dist = Math.abs(ev.clientY - y)
-        if (dist < bestDist) {
-          bestDist = dist
-          targetTrackId = d.trackRowIds[i]
-        }
-      })
-      const tracks = useProjectStore.getState().project.tracks
-      const targetTrack = tracks.find((t) => t.id === targetTrackId)
-      const sourceTrack = tracks.find((t) => t.id === d.sourceTrackId)
-      if (!targetTrack || !sourceTrack) return
-
-      if (targetTrack.type !== sourceTrack.type) {
-        // Don't allow cross-type drops in this barebones build.
-        return
-      }
-
-      if (isMainVideoTrack(useProjectStore.getState().project, targetTrack.id)) {
-        // The main roll is magnetic: a drop picks an insertion point between its clips.
-        const siblings = targetTrack.clips.filter((c) => c.id !== d.clipId)
-        let index = siblings.length
-        for (let i = 0; i < siblings.length; i++) {
-          if (newStart < siblings[i].start + siblings[i].duration / 2) {
-            index = i
-            break
-          }
-        }
-        reorderVideoClip(d.clipId, targetTrackId, index)
-      } else {
-        // Overlay video / audio / text float: the clip lands where it was dropped (snapped).
-        moveFreeClip(d.clipId, placed?.start ?? newStart, targetTrackId)
-      }
+      const target = resolveClipDrag({ ...d, dx: ev.clientX - d.pointerStartX, pointerY: ev.clientY, snap: !(ev.metaKey || ev.ctrlKey) })
+      if (target.kind === 'main') reorderVideoClip(d.clipId, target.trackId, target.index)
+      else if (target.kind === 'free') moveFreeClip(d.clipId, target.start, target.trackId)
+      else if (target.kind === 'newTrack') moveClipToNewTrack(d.clipId, target.start)
     }
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
   }
 
+  /**
+   * Edge trim. The edge follows the pointer's travel from where it was grabbed (grabbing never
+   * jumps it to the cursor), only after a few px of movement, and snaps to clip edges and the
+   * playhead. trimClip works on the clip as it is now, so the requested time is derived from the
+   * total travel minus what's already applied: a start trim on the magnetic main track doesn't
+   * move the clip's start, and recomputing from the live clip used to re-apply the whole drag
+   * on every move (the trim ran away from the cursor). One undo step per gesture.
+   */
   function onTrimPointerDown(e: React.MouseEvent, clip: Clip, edge: 'start' | 'end') {
     e.stopPropagation()
+    e.preventDefault()
     selectClip(clip.id)
     setTrim({ clipId: clip.id, edge })
+    const before = useProjectStore.getState().project
+    const orig = { start: clip.start, duration: clip.duration }
+    const startX = e.clientX
+    let started = false
+    const edgeTime0 = edge === 'start' ? orig.start : orig.start + orig.duration
+    const targets: number[] = [useProjectStore.getState().playhead]
+    for (const t of before.tracks) for (const c of t.clips) if (c.id !== clip.id) targets.push(c.start, c.start + c.duration)
 
     function onMove(ev: MouseEvent) {
-      const t = timeAt(ev.clientX)
-      trimClip(clip.id, edge, t)
+      const dx = ev.clientX - startX
+      if (!started && Math.abs(dx) < TRIM_DEADZONE_PX) return
+      started = true
+      let want = edgeTime0 + dx / pxPerSecond
+      let snapTime: number | null = null
+      if (!(ev.metaKey || ev.ctrlKey)) {
+        let best = TRIM_SNAP_PX / pxPerSecond
+        for (const t of targets) {
+          if (Math.abs(t - want) <= best) {
+            best = Math.abs(t - want)
+            snapTime = t
+          }
+        }
+        if (snapTime !== null) want = snapTime
+      }
+      setTrimSnap(snapTime)
+      const cur = useProjectStore.getState().project.tracks.flatMap((t) => t.clips).find((c) => c.id === clip.id)
+      if (!cur) return
+      if (edge === 'start') {
+        const wantDelta = want - orig.start
+        const applied = orig.duration - cur.duration
+        trimClip(clip.id, 'start', cur.start + (wantDelta - applied))
+      } else {
+        trimClip(clip.id, 'end', cur.start + (want - orig.start))
+      }
     }
     function onUp() {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
       setTrim(null)
+      setTrimSnap(null)
+      if (started) recordUndoPoint(before)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  /** Audio clips: CapCut's volume line. Drag it up/down (middle = 100%, top = 200%, bottom = mute);
+   *  the waveform scales live. One undo step per gesture. */
+  function onVolumePointerDown(e: React.MouseEvent, clip: Clip, clipHeight: number) {
+    if (clip.kind !== 'media') return
+    e.stopPropagation()
+    e.preventDefault()
+    selectClip(clip.id)
+    const before = useProjectStore.getState().project
+    const startY = e.clientY
+    const v0 = clip.volume
+    setVolumeDrag({ clipId: clip.id })
+    function onMove(ev: MouseEvent) {
+      // The full clip height spans 0..200%.
+      const v = Math.min(2, Math.max(0, v0 - ((ev.clientY - startY) / Math.max(20, clipHeight)) * 2))
+      updateMediaClipProps(clip.id, { volume: Math.round(v * 100) / 100 })
+    }
+    function onUp() {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      setVolumeDrag(null)
+      recordUndoPoint(before)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  /** Fade handles (CapCut): drag the dot at a clip's top corner inward to fade it in / out. The
+   *  two fades never overlap. One undo step per gesture. */
+  function onFadePointerDown(e: React.MouseEvent, clip: Clip, which: 'in' | 'out') {
+    if (clip.kind !== 'media') return
+    e.stopPropagation()
+    e.preventDefault()
+    selectClip(clip.id)
+    const before = useProjectStore.getState().project
+    const startX = e.clientX
+    const f0 = (which === 'in' ? clip.fadeIn : clip.fadeOut) ?? 0
+    setFadeDrag({ clipId: clip.id, which })
+    function onMove(ev: MouseEvent) {
+      const cur = useProjectStore.getState().project.tracks.flatMap((t) => t.clips).find((c) => c.id === clip.id)
+      if (!cur || cur.kind !== 'media') return
+      const dx = (ev.clientX - startX) / pxPerSecond
+      const other = (which === 'in' ? cur.fadeOut : cur.fadeIn) ?? 0
+      const v = Math.min(Math.max(0, f0 + (which === 'in' ? dx : -dx)), Math.max(0, cur.duration - other))
+      const rounded = Math.round(v * 100) / 100
+      updateMediaClipProps(clip.id, which === 'in' ? { fadeIn: rounded || undefined } : { fadeOut: rounded || undefined })
+    }
+    function onUp() {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      setFadeDrag(null)
+      recordUndoPoint(before)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  /** Rectangle (marquee) selection from an empty spot in the lanes. ⇧/⌘ adds to the selection. A
+   *  plain click without dragging clears the selection, as before. */
+  function onLanePointerDown(e: React.MouseEvent) {
+    if (e.button !== 0) return
+    const body = bodyRef.current
+    if (!body) return
+    const additive = e.shiftKey || e.metaKey || e.ctrlKey
+    const base = additive ? selectionOf(useProjectStore.getState()) : []
+    const b = body.getBoundingClientRect()
+    const x0 = e.clientX - b.left
+    const y0 = e.clientY - b.top
+    let moved = false
+    function onMove(ev: MouseEvent) {
+      const bb = body!.getBoundingClientRect()
+      const x1 = ev.clientX - bb.left
+      const y1 = ev.clientY - bb.top
+      if (!moved && Math.hypot(x1 - x0, y1 - y0) < 4) return
+      moved = true
+      setMarquee({ x0, y0, x1, y1 })
+      const left = Math.min(ev.clientX, x0 + bb.left)
+      const right = Math.max(ev.clientX, x0 + bb.left)
+      const top = Math.min(ev.clientY, y0 + bb.top)
+      const bottom = Math.max(ev.clientY, y0 + bb.top)
+      const hit: string[] = []
+      body!.querySelectorAll<HTMLElement>('.clip[data-clip-id]').forEach((el) => {
+        const r = el.getBoundingClientRect()
+        if (r.right > left && r.left < right && r.bottom > top && r.top < bottom) hit.push(el.dataset.clipId!)
+      })
+      setSelection([...new Set([...base, ...hit])])
+    }
+    function onUp() {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      setMarquee(null)
+      if (!moved && !additive) selectClip(null)
     }
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
@@ -859,12 +1118,34 @@ export default function Timeline() {
     )
   }
 
+  // The live drop target of a clip drag (null until the pointer has actually moved).
+  const dragTarget = drag && (Math.abs(drag.dx) >= 3 || Math.abs(drag.pointerY - drag.pointerStartY) >= 3) ? resolveClipDrag(drag) : null
+  const draggedClip = drag ? project.tracks.flatMap((t) => t.clips).find((c) => c.id === drag.clipId) ?? null : null
+
+  /** How far a clip is drawn from its real start while something is hovering: on the main track
+   *  the clips part to open a gap where the dragged clip / bin media will go, and close up behind
+   *  a main-track clip being dragged away. */
+  function gapShift(clip: Clip, track: Track): number {
+    if (!isMainVideoTrack(project, track.id)) return 0
+    let shift = 0
+    if (drag && dragTarget && draggedClip && drag.sourceTrackId === track.id) shift -= mainRemovalShift(track, drag.clipId)(clip)
+    if (dragTarget?.kind === 'main' && dragTarget.trackId === track.id && draggedClip) {
+      const siblings = track.clips.filter((c) => c.id !== draggedClip.id)
+      const order = siblings.indexOf(clip)
+      if (order >= dragTarget.index) shift += draggedClip.duration
+    }
+    if (mediaGhost && !mediaGhost.newTrack && mediaGhost.trackId === track.id && clip.start >= mediaGhost.start - 1e-6) shift += mediaGhost.duration
+    return shift
+  }
+
   function renderClip(clip: Clip, track: Track, inset: { left: number; right: number } = { left: 0, right: 0 }) {
-    const isDraggingThis = drag?.clipId === clip.id
+    const isDraggingThis = drag?.clipId === clip.id && dragTarget !== null
+    // A main-track clip being dragged leaves its slot (the roll closes up; the ghost shows where
+    // it will go). Elsewhere the original stays, dimmed, until the drop.
+    if (isDraggingThis && isMainVideoTrack(project, track.id)) return null
     // Clips next to a transition are drawn shortened by half of it, so they meet at the cut and
     // the transition block sits over the join (CapCut's look). Time positions are unchanged.
-    const dragPlaced = isDraggingThis ? freeDragPlacement(drag) : null
-    const left = (isDraggingThis ? (dragPlaced ? dragPlaced.start * pxPerSecond : drag.clipStartPx + drag.dx) : clip.start * pxPerSecond) + inset.left * pxPerSecond
+    const left = (clip.start + gapShift(clip, track)) * pxPerSecond + inset.left * pxPerSecond
     const width = Math.max((clip.duration - inset.left - inset.right) * pxPerSecond, 4)
 
     const asset = clip.kind === 'media' ? project.assets.find((a) => a.id === clip.assetId) : undefined
@@ -908,8 +1189,9 @@ export default function Timeline() {
     return (
       <div
         key={clip.id}
-        className={`clip ${clipClassName(clip, track)} ${hasCover ? 'has-cover' : ''} ${selectedIds.includes(clip.id) ? 'selected' : ''} ${clip.disabled ? 'disabled' : ''} ${offline ? 'offline' : ''} ${fxDrop?.resolution.kind === 'attach' && fxDrop.resolution.clipId === clip.id ? 'drop-attach' : ''}`}
-        style={{ left, width, zIndex: isDraggingThis ? 10 : 1 }}
+        data-clip-id={clip.id}
+        className={`clip ${clipClassName(clip, track)} ${hasCover ? 'has-cover' : ''} ${selectedIds.includes(clip.id) ? 'selected' : ''} ${clip.disabled ? 'disabled' : ''} ${offline ? 'offline' : ''} ${isDraggingThis ? 'drag-source' : ''} ${fxDrop?.resolution.kind === 'attach' && fxDrop.resolution.clipId === clip.id ? 'drop-attach' : ''}`}
+        style={{ left, width, zIndex: 1 }}
         onMouseDown={(e) => onClipPointerDown(e, clip, track)}
         onContextMenu={(e) => {
           e.preventDefault()
@@ -955,10 +1237,57 @@ export default function Timeline() {
             endFrac={endFrac}
             visibleStart={visibleStart}
             visibleEnd={visibleEnd}
+            gain={track.type === 'audio' && clip.kind === 'media' ? clip.volume : 1}
           />
         )}
-        {track.type !== 'audio' && <div className="trim-handle left" onMouseDown={(e) => onTrimPointerDown(e, clip, 'start')} />}
-        {track.type !== 'audio' && <div className="trim-handle right" onMouseDown={(e) => onTrimPointerDown(e, clip, 'end')} />}
+        {clip.kind === 'media' && (() => {
+          // Shaded triangles over the faded parts, and the two corner handles (CapCut).
+          const fi = Math.min(clip.fadeIn ?? 0, clip.duration) * pxPerSecond
+          const fo = Math.min(clip.fadeOut ?? 0, clip.duration) * pxPerSecond
+          const offset = inset.left * pxPerSecond
+          const fiX = Math.max(0, fi - offset)
+          const foX = Math.max(0, fo - inset.right * pxPerSecond)
+          return (
+            <>
+              {(fiX > 0 || foX > 0) && (
+                <svg className="fade-shade" width={width} height="100%" preserveAspectRatio="none" viewBox={`0 0 ${width} 100`}>
+                  {fiX > 0 && <polygon points={`0,0 ${fiX},0 0,100`} />}
+                  {foX > 0 && <polygon points={`${width - foX},0 ${width},0 ${width},100`} />}
+                </svg>
+              )}
+              <div
+                className={`fade-handle in ${fi > 0 ? 'set' : ''} ${fadeDrag?.clipId === clip.id && fadeDrag.which === 'in' ? 'active' : ''}`}
+                style={{ left: Math.min(fiX, width - 8) }}
+                title={fi > 0 ? `Fade in ${(clip.fadeIn ?? 0).toFixed(1)}s` : 'Drag to fade in'}
+                onMouseDown={(e) => onFadePointerDown(e, clip, 'in')}
+              />
+              <div
+                className={`fade-handle out ${fo > 0 ? 'set' : ''} ${fadeDrag?.clipId === clip.id && fadeDrag.which === 'out' ? 'active' : ''}`}
+                style={{ right: Math.min(foX, width - 8) }}
+                title={fo > 0 ? `Fade out ${(clip.fadeOut ?? 0).toFixed(1)}s` : 'Drag to fade out'}
+                onMouseDown={(e) => onFadePointerDown(e, clip, 'out')}
+              />
+              {fadeDrag?.clipId === clip.id && (
+                <span className="fade-chip" style={fadeDrag.which === 'in' ? { left: fiX + 10 } : { right: foX + 10 }}>
+                  Fade {fadeDrag.which} {((fadeDrag.which === 'in' ? clip.fadeIn : clip.fadeOut) ?? 0).toFixed(1)}s
+                </span>
+              )}
+            </>
+          )
+        })()}
+        {track.type === 'audio' && clip.kind === 'media' && (
+          <div
+            className={`volume-line ${volumeDrag?.clipId === clip.id ? 'active' : ''}`}
+            // Middle = 100%, top = 200%, bottom = muted.
+            style={{ top: `${(1 - Math.min(2, clip.volume) / 2) * 100}%` }}
+            onMouseDown={(e) => onVolumePointerDown(e, clip, (e.currentTarget.parentElement?.clientHeight ?? rowHeight) - 4)}
+            title={`Volume ${Math.round(clip.volume * 100)}%. Drag up or down.`}
+          >
+            {volumeDrag?.clipId === clip.id && <span className="volume-chip">{Math.round(clip.volume * 100)}%</span>}
+          </div>
+        )}
+        <div className="trim-handle left" style={{ width: Math.min(TRIM_HANDLE_PX, width / 3) }} onMouseDown={(e) => onTrimPointerDown(e, clip, 'start')} />
+        <div className="trim-handle right" style={{ width: Math.min(TRIM_HANDLE_PX, width / 3) }} onMouseDown={(e) => onTrimPointerDown(e, clip, 'end')} />
       </div>
     )
   }
@@ -986,7 +1315,7 @@ export default function Timeline() {
   }
 
   return (
-    <div className="timeline-wrap" ref={wrapRef}>
+    <div className="timeline-wrap">
       {ctxMenu && <ClipContextMenu x={ctxMenu.x} y={ctxMenu.y} clipId={ctxMenu.clipId} onClose={() => setCtxMenu(null)} />}
       <div className="timeline-toolbar">
         <div className="tl-tools">
@@ -1019,10 +1348,18 @@ export default function Timeline() {
           ))}
         </div>
       </div>
-      <div className="timeline-body" ref={bodyRef} style={{ width: totalWidth }}>
+      {/* Only this part scrolls: the toolbar above stays put, and the ruler sticks to its top. */}
+      <div className="timeline-scroll" ref={wrapRef}>
+      <div className={`timeline-body ${dragTarget || mediaGhost ? 'parting' : ''}`} ref={bodyRef} style={{ width: totalWidth }}>
         <div className="ruler" onMouseDown={onRulerPointerDown}>
           {/* Sticky corner above the track labels, so ticks and the playhead handle slide under it. */}
           <div className="ruler-corner" onMouseDown={(e) => e.stopPropagation()} />
+          <div
+            className={`playhead-handle ${mediaGhost?.snapKind === 'playhead' ? 'snapped' : ''}`}
+            style={{ left: LABEL_WIDTH + playhead * pxPerSecond }}
+            onMouseDown={onRulerPointerDown}
+            title="Drag to scrub"
+          />
           {marks.map(({ t, major }) => (
             <div
               key={t}
@@ -1050,7 +1387,7 @@ export default function Timeline() {
                 if (el) trackRowRefs.current.set(track.id, el)
               }}
               style={{ width: totalWidth - LABEL_WIDTH }}
-              onMouseDown={(e) => e.button !== 2 && selectClip(null)}
+              onMouseDown={onLanePointerDown}
               onContextMenu={(e) => {
                 e.preventDefault()
                 setCtxMenu({ x: e.clientX, y: e.clientY, clipId: null })
@@ -1078,7 +1415,17 @@ export default function Timeline() {
                   </div>
                 )
               })()}
-              {mediaGhost?.trackId === track.id && (
+              {dragTarget && draggedClip && (dragTarget.kind === 'main' || dragTarget.kind === 'free') && dragTarget.trackId === track.id && (
+                <div
+                  className={`drop-ghost ${track.type === 'audio' ? 'audio' : 'video'}`}
+                  style={{ left: (dragTarget.kind === 'main' ? dragTarget.gapStart : dragTarget.start) * pxPerSecond, width: Math.max(draggedClip.duration * pxPerSecond, 4) }}
+                >
+                  <div className="drop-ghost-chips">
+                    <span className="drop-ghost-chip">{formatTimecode(dragTarget.kind === 'main' ? dragTarget.gapStart : dragTarget.start)}</span>
+                  </div>
+                </div>
+              )}
+              {mediaGhost?.trackId === track.id && !mediaGhost.newTrack && (
                 <div
                   className={`drop-ghost ${mediaGhost.kind}`}
                   style={{ left: mediaGhost.start * pxPerSecond, width: Math.max(mediaGhost.duration * pxPerSecond, 4) }}
@@ -1097,16 +1444,62 @@ export default function Timeline() {
             </div>
           </div>
         ))}
-        {drag && (() => {
-          const placed = freeDragPlacement(drag)
-          return placed?.snapTime != null ? <div className="drop-snap-line" style={{ left: LABEL_WIDTH + placed.snapTime * pxPerSecond }} /> : null
+        {dragTarget && (dragTarget.kind === 'free' || dragTarget.kind === 'newTrack') && dragTarget.snapTime != null && (
+          <div className="drop-snap-line" style={{ left: LABEL_WIDTH + dragTarget.snapTime * pxPerSecond }} />
+        )}
+        {trimSnap != null && <div className="drop-snap-line" style={{ left: LABEL_WIDTH + trimSnap * pxPerSecond }} />}
+        {(() => {
+          // "New track" ghost: a video landing on top of another video (or on a text row) gets its
+          // own overlay track, drawn as an insertion line above the topmost video row.
+          const ghostStart = dragTarget?.kind === 'newTrack' ? dragTarget.start : mediaGhost?.newTrack ? mediaGhost.start : null
+          const ghostDur = dragTarget?.kind === 'newTrack' ? draggedClip?.duration ?? 0 : mediaGhost?.newTrack ? mediaGhost.duration : 0
+          if (ghostStart == null) return null
+          const topVideo = rowTracks.find((t) => t.type === 'video')
+          const lane = topVideo ? trackRowRefs.current.get(topVideo.id) : undefined
+          const body = bodyRef.current
+          if (!lane || !body) return null
+          const y = lane.getBoundingClientRect().top - body.getBoundingClientRect().top
+          return (
+            <div className="new-track-ghost" style={{ top: y - 2 }}>
+              <div className="new-track-ghost-clip" style={{ left: LABEL_WIDTH + ghostStart * pxPerSecond, width: Math.max(ghostDur * pxPerSecond, 4) }}>
+                <span className="drop-ghost-chip">New track</span>
+              </div>
+            </div>
+          )
         })()}
+        {drag && dragTarget && draggedClip && bodyRef.current && (() => {
+          // The dragged clip itself, glued to the cursor; the grey ghost shows where it will land.
+          const b = bodyRef.current.getBoundingClientRect()
+          const srcTrack = project.tracks.find((t) => t.id === drag.sourceTrackId)
+          const a = draggedClip.kind === 'media' ? project.assets.find((x) => x.id === draggedClip.assetId) : undefined
+          return (
+            <div
+              className={`clip drag-float ${srcTrack ? clipClassName(draggedClip, srcTrack) : ''}`}
+              style={{
+                left: drag.pointerStartX - b.left + drag.dx - drag.grabX,
+                top: drag.pointerY - b.top - drag.grabY,
+                width: Math.max(draggedClip.duration * pxPerSecond, 4),
+                height: drag.clipHeight,
+                bottom: 'auto'
+              }}
+            >
+              <div className="clip-header">
+                <span className="clip-title">{draggedClip.kind === 'text' ? draggedClip.text : a?.name ?? ''}</span>
+              </div>
+            </div>
+          )
+        })()}
+        {marquee && (
+          <div
+            className="timeline-marquee"
+            style={{ left: Math.min(marquee.x0, marquee.x1), top: Math.min(marquee.y0, marquee.y1), width: Math.abs(marquee.x1 - marquee.x0), height: Math.abs(marquee.y1 - marquee.y0) }}
+          />
+        )}
         {mediaGhost?.snapTime != null && mediaGhost.snapKind !== 'playhead' && (
           <div className="drop-snap-line" style={{ left: LABEL_WIDTH + mediaGhost.snapTime * pxPerSecond }} />
         )}
-        <div className={`playhead ${mediaGhost?.snapKind === 'playhead' ? 'snapped' : ''}`} style={{ left: LABEL_WIDTH + playhead * pxPerSecond }}>
-          <div className="playhead-handle" onMouseDown={onRulerPointerDown} title="Drag to scrub" />
-        </div>
+        <div className={`playhead ${mediaGhost?.snapKind === 'playhead' ? 'snapped' : ''}`} style={{ left: LABEL_WIDTH + playhead * pxPerSecond }} />
+      </div>
       </div>
     </div>
   )

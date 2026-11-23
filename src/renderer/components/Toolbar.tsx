@@ -3,6 +3,7 @@ import { loadOpenedProject, saveProject } from '../projectIO'
 import { ASPECT_PRESETS, aspectPresetFor } from '@shared/types'
 import { runExport, useExportStatus } from '../export/runExport'
 import logoUrl from '../assets/logo.png'
+import { useToastStore } from '../state/toastStore'
 
 export default function Toolbar({ onGoHome }: { onGoHome: () => void }) {
   const project = useProjectStore((s) => s.project)
@@ -45,7 +46,16 @@ export default function Toolbar({ onGoHome }: { onGoHome: () => void }) {
     const path = await window.api.exportDialog(project.name)
     if (!path) return
     const result = await runExport(project, path, 'Export')
-    if (!result.ok) alert(`Export failed:\n${result.error}`)
+    const toast = useToastStore.getState().push
+    if (!result.ok) {
+      toast('error', `Export failed: ${result.error}`, 12000)
+      return
+    }
+    // Tell the user it's done and where it went (CapCut shows a finished card with "Open folder").
+    const saved = result.outputPath ?? path
+    const name = saved.split(/[\\/]/).pop() ?? saved
+    const where = navigator.platform.toLowerCase().includes('mac') ? 'Show in Finder' : 'Show in folder'
+    toast('success', `Video exported: "${name}" was saved.`, 12000, { label: where, run: () => void window.api.showInFolder(saved) })
   }
 
   function addText() {

@@ -153,6 +153,67 @@ export default function MediaBin() {
   const tabsRef = useRef<HTMLDivElement>(null)
   const binRef = useRef<HTMLDivElement>(null)
   const [tabOverflow, setTabOverflow] = useState({ left: false, right: false })
+  // Media-pool selection (click, ⇧/⌘-click, or a drag rectangle from empty space). Delete removes
+  // the selection; dragging a selected item drags them all onto the timeline.
+  const [selectedAssets, setSelectedAssets] = useState<string[]>([])
+  const [binMarquee, setBinMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null)
+
+  function onAssetAreaPointerDown(e: React.MouseEvent<HTMLDivElement>) {
+    if (e.button !== 0 || (e.target as HTMLElement).closest('.asset-card')) return
+    const area = e.currentTarget
+    const additive = e.shiftKey || e.metaKey || e.ctrlKey
+    const base = additive ? selectedAssets : []
+    const r0 = area.getBoundingClientRect()
+    const x0 = e.clientX - r0.left
+    const y0 = e.clientY - r0.top + area.scrollTop
+    let moved = false
+    e.preventDefault()
+    function onMove(ev: MouseEvent) {
+      const r = area.getBoundingClientRect()
+      const x1 = ev.clientX - r.left
+      const y1 = ev.clientY - r.top + area.scrollTop
+      if (!moved && Math.hypot(x1 - x0, y1 - y0) < 4) return
+      moved = true
+      setBinMarquee({ x0, y0, x1, y1 })
+      const left = Math.min(x0, x1) + r.left
+      const right = Math.max(x0, x1) + r.left
+      const top = Math.min(y0, y1) + r.top - area.scrollTop
+      const bottom = Math.max(y0, y1) + r.top - area.scrollTop
+      const hit: string[] = []
+      area.querySelectorAll<HTMLElement>('.asset-card[data-asset-id]').forEach((el) => {
+        const b = el.getBoundingClientRect()
+        if (b.right > left && b.left < right && b.bottom > top && b.top < bottom) hit.push(el.dataset.assetId!)
+      })
+      setSelectedAssets([...new Set([...base, ...hit])])
+    }
+    function onUp() {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      setBinMarquee(null)
+      if (!moved && !additive) setSelectedAssets([])
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  function onBinKeyDown(e: React.KeyboardEvent) {
+    const target0 = e.target as HTMLElement
+    if ((e.metaKey || e.ctrlKey) && e.code === 'KeyA' && target0.tagName !== 'INPUT' && target0.tagName !== 'TEXTAREA') {
+      e.preventDefault()
+      setSelectedAssets(project.assets.map((a) => a.id))
+      return
+    }
+    if ((e.key !== 'Backspace' && e.key !== 'Delete') || selectedAssets.length === 0) return
+    const target = e.target as HTMLElement
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return
+    e.preventDefault()
+    const ids = selectedAssets.filter((id) => project.assets.some((a) => a.id === id))
+    const used = project.tracks.reduce((n, t) => n + t.clips.filter((c) => c.kind === 'media' && ids.includes(c.assetId)).length, 0)
+    const label = ids.length === 1 ? `"${project.assets.find((a) => a.id === ids[0])?.name}"` : `${ids.length} items`
+    if (used > 0 && !confirm(`${label} ${ids.length === 1 ? 'is' : 'are'} used in ${used} clip${used > 1 ? 's' : ''} on the timeline. Remove ${ids.length === 1 ? 'it' : 'them'} and those clips?`)) return
+    ids.forEach(removeAsset)
+    setSelectedAssets([])
+  }
   function updateTabOverflow() {
     const el = tabsRef.current
     if (!el) return
@@ -253,6 +314,13 @@ export default function MediaBin() {
     return (
       <>
         {assets.length === 0 && <div className="empty-hint">{emptyHint}</div>}
+        <div className="asset-area" onMouseDown={onAssetAreaPointerDown}>
+        {binMarquee && (
+          <div
+            className="bin-marquee"
+            style={{ left: Math.min(binMarquee.x0, binMarquee.x1), top: Math.min(binMarquee.y0, binMarquee.y1), width: Math.abs(binMarquee.x1 - binMarquee.x0), height: Math.abs(binMarquee.y1 - binMarquee.y0) }}
+          />
+        )}
         <div className="asset-grid">
           {assets.map((asset) => {
             // Show the FIRST frame of the cover sprite as the card thumbnail, fit to the card's
@@ -271,16 +339,25 @@ export default function MediaBin() {
             const offline = missingAssetIds.includes(asset.id)
             return (
               <div
-                className={`asset-card ${previewAssetId === asset.id ? 'previewing' : ''} ${offline ? 'offline' : ''}`}
+                className={`asset-card ${previewAssetId === asset.id ? 'previewing' : ''} ${selectedAssets.includes(asset.id) ? 'selected' : ''} ${offline ? 'offline' : ''}`}
                 key={asset.id}
+                data-asset-id={asset.id}
                 draggable
                 onDragStart={(e) => {
                   e.dataTransfer.setData(ASSET_DRAG_MIME, asset.id)
                   e.dataTransfer.effectAllowed = 'copy'
-                  startAssetDrag(asset.id)
+                  // Dragging one of several selected items drags them all (dropped one after another).
+                  startAssetDrag(asset.id, selectedAssets.includes(asset.id) ? selectedAssets : [asset.id])
                 }}
                 onDragEnd={endAssetDrag}
-                onClick={() => setPreviewAsset(asset.id)}
+                onClick={(e) => {
+                  if (e.shiftKey || e.metaKey || e.ctrlKey) {
+                    setSelectedAssets((sel) => (sel.includes(asset.id) ? sel.filter((id) => id !== asset.id) : [...sel, asset.id]))
+                    return
+                  }
+                  setSelectedAssets([asset.id])
+                  setPreviewAsset(asset.id)
+                }}
                 onDoubleClick={() => handleAddToTimeline(asset)}
                 title="Click to preview, drag onto the timeline, or double-click to add"
               >
@@ -312,6 +389,7 @@ export default function MediaBin() {
             )
           })}
         </div>
+        </div>
       </>
     )
   }
@@ -320,6 +398,8 @@ export default function MediaBin() {
     <div
       ref={binRef}
       className={`panel media-bin ${dropActive ? 'drop-active' : ''}`}
+      tabIndex={-1}
+      onKeyDown={onBinKeyDown}
       onDragOver={onDragOver}
       onDragLeave={() => setDropActive(false)}
       onDrop={onDrop}

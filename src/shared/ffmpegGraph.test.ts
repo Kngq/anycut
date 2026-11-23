@@ -206,3 +206,30 @@ describe('baked text overlay', () => {
     expect(plan.filterComplex).not.toContain('drawtext')
   })
 })
+
+describe('buildFfmpegPlan — transition audio crossfade', () => {
+  function withAudio(p: Project): Project {
+    return { ...p, assets: p.assets.map((a) => ({ ...a, hasAudio: true })) }
+  }
+
+  it('fades the outgoing clip out and the incoming clip in over the transition (equal power)', () => {
+    const plan = buildFfmpegPlan(withAudio(twoClipProject({ transition: 'crossfade' })))
+    // Clip 1 (4 s) fades out over its last second; clip 2 fades in over its first second.
+    expect(plan.filterComplex).toContain('afade=t=out:st=3:d=1:curve=qsin,volume=1,adelay=0|0')
+    expect(plan.filterComplex).toContain('afade=t=in:st=0:d=1:curve=qsin,volume=1,adelay=4000|4000')
+    // Both stay in the mix (no concat/gap): the overlap is what makes the crossfade.
+    expect(plan.filterComplex).toContain('amix=inputs=2:normalize=0')
+  })
+
+  it('adds no audio fades without a transition', () => {
+    const plan = buildFfmpegPlan(withAudio(twoClipProject()))
+    expect(plan.filterComplex).not.toContain('afade')
+  })
+
+  it('adds no fades when the neighbouring clip is deactivated', () => {
+    const p = withAudio(twoClipProject({ transition: 'crossfade' }))
+    p.tracks[0].clips[0] = { ...p.tracks[0].clips[0], disabled: true }
+    const plan = buildFfmpegPlan(p)
+    expect(plan.filterComplex).not.toContain('afade')
+  })
+})

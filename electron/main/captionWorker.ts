@@ -15,9 +15,10 @@
  *        { type: 'error', id, message }
  */
 import fs from 'node:fs/promises'
+import { ensureWhisperModel, WHISPER_MODEL_ID } from './whisperModel'
 import { chunksToWords, spreadPhraseWords, wordAlignmentFailed, type AsrChunk, type CaptionWord } from '@shared/captions'
 
-const MODEL_ID = 'onnx-community/whisper-base_timestamped'
+const MODEL_ID = WHISPER_MODEL_ID
 const SAMPLE_RATE = 16000
 /** Whisper sees 30 s at a time. transformers.js's own chunking drops most words when asked for
  *  word timestamps (measured: 21 words out of ~280 in 111 s), so we window the audio ourselves,
@@ -53,25 +54,17 @@ let asrPromise: Promise<Asr> | null = null
 function loadAsr(cacheDir: string, onProgress: (ratio: number) => void): Promise<Asr> {
   if (!asrPromise) {
     asrPromise = (async () => {
+      // Download + verify the files ourselves (whisperModel.ts), then load only from that folder:
+      // transformers.js's own cache kept truncated downloads and then failed on them forever.
+      await ensureWhisperModel(cacheDir, onProgress)
       const { pipeline, env } = await import('@huggingface/transformers')
-      env.cacheDir = cacheDir
-      env.allowLocalModels = false
-      // Aggregate byte progress across the model's files.
-      const files = new Map<string, { loaded: number; total: number }>()
+      env.allowRemoteModels = false
+      env.allowLocalModels = true
+      env.localModelPath = cacheDir
+      env.useFSCache = false
       const asr = await pipeline('automatic-speech-recognition', MODEL_ID, {
         // fp32 encoder (quantising it costs accuracy), 8-bit decoder (most of the speed win).
-        dtype: { encoder_model: 'fp32', decoder_model_merged: 'q8' },
-        progress_callback: (p: { status: string; file?: string; loaded?: number; total?: number }) => {
-          if (p.status !== 'progress' || !p.file || !p.total) return
-          files.set(p.file, { loaded: p.loaded ?? 0, total: p.total })
-          let loaded = 0
-          let total = 0
-          for (const f of files.values()) {
-            loaded += f.loaded
-            total += f.total
-          }
-          onProgress(total > 0 ? loaded / total : 0)
-        }
+        dtype: { encoder_model: 'fp32', decoder_model_merged: 'q8' }
       })
       fixWordTimestampCrop(asr as unknown as Asr)
       return asr as unknown as Asr

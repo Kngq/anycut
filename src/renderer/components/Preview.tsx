@@ -1,13 +1,16 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { animatedTransformCached } from '@shared/animations'
 import { filterDef } from '@shared/filters'
 import { renderFiltered } from '../filterRenderer'
 import { useProjectStore } from '../state/projectStore'
-import type { Clip, MediaAsset, MediaClip, Project, Track } from '@shared/types'
-import { clipSpeedAt, interpolateTransform, isFullCrop, projectDuration, sourceTimeFor, formatMMSS } from '@shared/types'
+import type { Clip, ClipTransform, MediaAsset, MediaClip, Project, Track } from '@shared/types'
+import { clipFadeGain, clipSpeedAt, interpolateTransform, isFullCrop, projectDuration, sourceTimeFor, formatMMSS } from '@shared/types'
 import { applyPostEffects, effectGeometry } from '@shared/effects'
 import { compositeTransition, getTransitionLayer, transitionLayerCanvas } from '../transitions'
-import { drawTextLayer, preloadCaptionFonts } from '../textRender'
+import { drawTextLayer, preloadCaptionFonts, textBlockBounds } from '../textRender'
+import { offsetTransform, pointInBox, scaleTransform, snapAxis, type CanvasBox } from '@shared/transformEdit'
+import { useCropEditor } from './CropDialog'
+import '../preview.css'
 
 void preloadCaptionFonts()
 
@@ -31,6 +34,33 @@ const PLAYBACK_DRIFT_TOLERANCE = 0.12
 /** While free-running, a drift above this (seconds) is treated as a real discontinuity (clip
  *  switch, loop, large scrub) and corrected with a hard seek rather than a playbackRate nudge. */
 const RESYNC_SEEK_THRESHOLD = 0.6
+/** Screen pixels within which a dragged clip's centre snaps to the canvas centre lines. */
+const SNAP_PX = 6
+/** Screen pixels the pointer must travel before a press on a clip becomes a drag (a plain click
+ *  only selects). */
+const DRAG_START_PX = 2
+/** Fullscreen: hide the transport after this long without pointer movement. */
+const FULLSCREEN_IDLE_MS = 2500
+
+/** An in-progress preview gesture: moving a clip, or scaling it from a corner handle. */
+interface PreviewDrag {
+  clipId: string
+  mode: 'move' | 'scale'
+  kind: 'media' | 'text'
+  /** Project before the gesture, recorded as one undo step on release. */
+  before: Project
+  start: ClipTransform
+  box: CanvasBox
+  /** Pointer position at press, canvas px. */
+  px: number
+  py: number
+  /** Client position at press (drag threshold is in screen px). */
+  clientX: number
+  clientY: number
+  active: boolean
+  snapX: boolean
+  snapY: boolean
+}
 
 interface ActiveMedia {
   clip: MediaClip
@@ -164,6 +194,28 @@ function drawContain(
 }
 
 /** Draws a visible error banner instead of leaving a clip silently black/soundless. */
+let audioCtx: AudioContext | null = null
+const gainNodes = new WeakMap<HTMLMediaElement, GainNode>()
+/** A gain node for an <audio> element, created on first need. Once an element is routed through
+ *  Web Audio it stays routed (createMediaElementSource is one-shot), so the node is kept and set
+ *  back to 1 when the volume drops to 100% or below. */
+function audioGain(el: HTMLMediaElement): GainNode | null {
+  const existing = gainNodes.get(el)
+  if (existing) return existing
+  try {
+    audioCtx ??= new AudioContext()
+    const src = audioCtx.createMediaElementSource(el)
+    const gain = audioCtx.createGain()
+    src.connect(gain).connect(audioCtx.destination)
+    gainNodes.set(el, gain)
+    if (audioCtx.state === 'suspended') void audioCtx.resume()
+    return gain
+  } catch (err) {
+    console.warn('[anycut preview] volume above 100% unavailable', err)
+    return null
+  }
+}
+
 function drawMediaError(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, assetName: string, message: string) {
   const padding = 16
   const lineHeight = Math.max(canvasH * 0.028, 16)
@@ -233,6 +285,21 @@ export default function Preview() {
   const setPlayhead = useProjectStore((s) => s.setPlayhead)
   const duration = projectDuration(project)
   const previewAsset = previewAssetId ? project.assets.find((a) => a.id === previewAssetId) ?? null : null
+  const selectedClipId = useProjectStore((s) => s.selectedClipId)
+  // The preview bar's Crop button: shown while a video/image clip on a video track is selected.
+  const cropTarget = (() => {
+    if (!selectedClipId || previewAssetId) return null
+    for (const track of project.tracks) {
+      if (track.type !== 'video') continue
+      const clip = track.clips.find((c) => c.id === selectedClipId)
+      if (!clip || clip.kind !== 'media') continue
+      const asset = project.assets.find((a) => a.id === clip.assetId)
+      return asset && asset.kind !== 'audio' ? clip : null
+    }
+    return null
+  })()
+  const [isFullscreen, setIsFullscreen] = useState(false)
+  const [controlsIdle, setControlsIdle] = useState(false)
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const videoPoolRef = useRef<Map<string, HTMLVideoElement>>(new Map())
@@ -256,6 +323,248 @@ export default function Preview() {
   // Last decoded frame per clip (see frameFor), shown while that clip's <video> is seeking or not
   // ready yet instead of leaving its slot black.
   const frameCacheRef = useRef<Map<string, { canvas: HTMLCanvasElement; time: number; src: string; assetId: string }>>(new Map())
+  const wrapRef = useRef<HTMLDivElement | null>(null)
+  // Selection overlay: a layer exactly over the canvas's drawn area (pointer target for
+  // select/move/scale), the selected clip's box with corner handles, and the centre guides.
+  // Positioned imperatively from the render loop (no React re-render per frame).
+  const overlayRef = useRef<HTMLDivElement | null>(null)
+  const selBoxRef = useRef<HTMLDivElement | null>(null)
+  const guideVRef = useRef<HTMLDivElement | null>(null)
+  const guideHRef = useRef<HTMLDivElement | null>(null)
+  const overlayStyleCache = useRef<Map<HTMLElement, string>>(new Map())
+  const dragRef = useRef<PreviewDrag | null>(null)
+
+  /** Sets an element's inline style only when it changed (the loop runs every frame). */
+  function setCss(el: HTMLElement | null, css: string) {
+    if (!el || overlayStyleCache.current.get(el) === css) return
+    overlayStyleCache.current.set(el, css)
+    el.style.cssText = css
+  }
+
+  /** Source frame size of a media clip as drawn (before crop), from its live element when loaded. */
+  function sourceSize(clip: MediaClip, asset: MediaAsset): { w: number; h: number } | null {
+    if (asset.kind === 'image') {
+      const img = imagePoolRef.current.get(asset.id)
+      const w = img?.naturalWidth || asset.width || 0
+      const h = img?.naturalHeight || asset.height || 0
+      return w && h ? { w, h } : null
+    }
+    const v = videoPoolRef.current.get(clip.id)
+    const w = v?.videoWidth || asset.width || 0
+    const h = v?.videoHeight || asset.height || 0
+    return w && h ? { w, h } : null
+  }
+
+  /** Where a clip sits on the canvas at timeline time t (canvas px), matching drawContain /
+   *  drawTextClip — or null if it isn't on screen then. Effect geometry (shake, Ken Burns) is
+   *  left out on purpose so the box doesn't jitter. */
+  function clipBoxAt(project: Project, clip: Clip, t: number): CanvasBox | null {
+    if (clip.disabled || t < clip.start || t >= clip.start + clip.duration) return null
+    const { width: W, height: H } = project.canvas
+    if (clip.kind === 'text') {
+      const b = textBlockBounds.get(clip.id)
+      if (!b) return null
+      return { cx: b.x + b.w / 2, cy: b.y + b.h / 2, w: b.w, h: b.h, rot: 0 }
+    }
+    if (clip.kind !== 'media') return null
+    const asset = project.assets.find((a) => a.id === clip.assetId)
+    if (!asset || asset.kind === 'audio') return null
+    const size = sourceSize(clip, asset)
+    if (!size) return null
+    const c = clip.crop && !isFullCrop(clip.crop) ? clip.crop : { x: 0, y: 0, w: 1, h: 1 }
+    const mw = Math.max(1, size.w * c.w)
+    const mh = Math.max(1, size.h * c.h)
+    const tf = interpolateTransform(animatedTransformCached(clip), t - clip.start)
+    const fit = Math.min(W / mw, H / mh) * tf.scale
+    return { cx: W * tf.x, cy: H * tf.y, w: mw * fit, h: mh * fit, rot: clip.transform.rotation ?? 0 }
+  }
+
+  /** Clips under canvas point (px, py) at time t, topmost first: text (always drawn last), then
+   *  video tracks from the top down; within a track the later clip wins (a transition's
+   *  incoming clip). */
+  function clipsUnder(project: Project, t: number, px: number, py: number): Clip[] {
+    const hits: Clip[] = []
+    const scan = (type: Track['type']) => {
+      for (const track of [...project.tracks].reverse()) {
+        if (track.type !== type || track.hidden) continue
+        for (const clip of [...track.clips].reverse()) {
+          if (type === 'video' && clip.kind === 'media' && interpolateTransform(animatedTransformCached(clip), t - clip.start).opacity <= 0.01) continue
+          const box = clipBoxAt(project, clip, t)
+          if (box && pointInBox(box, px, py)) hits.push(clip)
+        }
+      }
+    }
+    scan('text')
+    scan('video')
+    return hits
+  }
+
+  function findClipById(project: Project, clipId: string): Clip | null {
+    for (const track of project.tracks) {
+      if (track.hidden || (track.type !== 'video' && track.type !== 'text')) continue
+      const clip = track.clips.find((c) => c.id === clipId)
+      if (clip) return clip
+    }
+    return null
+  }
+
+  /** Canvas px per CSS px is 1/k; returns the overlay's rect and k (CSS px per canvas px). */
+  function overlayScale(project: Project) {
+    const layer = overlayRef.current
+    if (!layer) return null
+    const rect = layer.getBoundingClientRect()
+    if (!rect.width) return null
+    return { rect, k: rect.width / project.canvas.width }
+  }
+
+  /** Called at the end of every rendered frame: keeps the overlay over the canvas and the
+   *  selection box on the selected clip. */
+  function syncOverlay(state: ReturnType<typeof useProjectStore.getState>, t: number) {
+    const canvas = canvasRef.current
+    const layer = overlayRef.current
+    if (!canvas || !layer) return
+    const { width: W, height: H } = state.project.canvas
+    const cw = canvas.clientWidth
+    const ch = canvas.clientHeight
+    // Sub-pixel exact (offsetLeft/Top round): the canvas is centred in the wrap, often at .5 px.
+    const cr = canvas.getBoundingClientRect()
+    const wr = (layer.offsetParent ?? canvas.parentElement)?.getBoundingClientRect()
+    const left = cr.left - (wr?.left ?? 0) + canvas.clientLeft
+    const top = cr.top - (wr?.top ?? 0) + canvas.clientTop
+    setCss(layer, `left:${left.toFixed(2)}px;top:${top.toFixed(2)}px;width:${cw}px;height:${ch}px`)
+    const k = cw / W
+    const clip = !state.previewAssetId && state.selectedClipId ? findClipById(state.project, state.selectedClipId) : null
+    const box = clip && k > 0 ? clipBoxAt(state.project, clip, t) : null
+    if (!box) {
+      setCss(selBoxRef.current, 'display:none')
+    } else {
+      const w = Math.abs(box.w) * k
+      const h = Math.abs(box.h) * k
+      setCss(
+        selBoxRef.current,
+        `left:${(box.cx * k - w / 2).toFixed(1)}px;top:${(box.cy * k - h / 2).toFixed(1)}px;width:${w.toFixed(1)}px;height:${h.toFixed(1)}px;transform:rotate(${box.rot}deg)`
+      )
+    }
+    const drag = dragRef.current
+    setCss(guideVRef.current, drag?.active && drag.snapX ? `left:${((W / 2) * k).toFixed(1)}px` : 'display:none')
+    setCss(guideHRef.current, drag?.active && drag.snapY ? `top:${((H / 2) * k).toFixed(1)}px` : 'display:none')
+  }
+
+  /** Press on the preview: pick the clip under the pointer (keeping the current selection when
+   *  the press is inside it, so a clip under an overlay can still be dragged), then drag to move
+   *  it or, from a corner handle, to scale it. Clicking empty canvas deselects. */
+  function onOverlayPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.button !== 0) return
+    const state = useProjectStore.getState()
+    if (state.previewAssetId) return
+    const geo = overlayScale(state.project)
+    if (!geo) return
+    e.preventDefault()
+    const { rect, k } = geo
+    const px = (e.clientX - rect.left) / k
+    const py = (e.clientY - rect.top) / k
+    const t = state.playhead
+    const project = state.project
+    const corner = (e.target as HTMLElement).closest('[data-corner]') !== null
+    const selected = state.selectedClipId ? findClipById(project, state.selectedClipId) : null
+    const selectedBox = selected ? clipBoxAt(project, selected, t) : null
+    let target: Clip | null = null
+    if (selected && selectedBox && (corner || pointInBox(selectedBox, px, py, 2 / k))) target = selected
+    else target = clipsUnder(project, t, px, py)[0] ?? null
+    if (!target) {
+      if (state.selectedClipId) state.selectClip(null)
+      return
+    }
+    if (target.id !== state.selectedClipId) state.selectClip(target.id)
+    const box = clipBoxAt(project, target, t)
+    if (!box) return
+    dragRef.current = {
+      clipId: target.id,
+      mode: corner && target === selected ? 'scale' : 'move',
+      kind: target.kind === 'text' ? 'text' : 'media',
+      before: project,
+      start: target.transform,
+      box,
+      px,
+      py,
+      clientX: e.clientX,
+      clientY: e.clientY,
+      active: false,
+      snapX: false,
+      snapY: false
+    }
+    const onMove = (ev: PointerEvent) => {
+      const drag = dragRef.current
+      if (!drag) return
+      if (!drag.active && Math.hypot(ev.clientX - drag.clientX, ev.clientY - drag.clientY) < DRAG_START_PX) return
+      drag.active = true
+      const s = useProjectStore.getState()
+      const g = overlayScale(s.project)
+      if (!g) return
+      const qx = (ev.clientX - g.rect.left) / g.k
+      const qy = (ev.clientY - g.rect.top) / g.k
+      const { width: W, height: H } = s.project.canvas
+      if (drag.mode === 'scale') {
+        const d0 = Math.hypot(drag.px - drag.box.cx, drag.py - drag.box.cy)
+        const d1 = Math.hypot(qx - drag.box.cx, qy - drag.box.cy)
+        s.setClipTransform(drag.clipId, scaleTransform(drag.start, d1 / Math.max(d0, 1)))
+        return
+      }
+      const sx = snapAxis(drag.box.cx + qx - drag.px, W / 2, SNAP_PX / g.k)
+      const sy = snapAxis(drag.box.cy + qy - drag.py, H / 2, SNAP_PX / g.k)
+      drag.snapX = sx.snapped
+      drag.snapY = sy.snapped
+      const dxPx = sx.value - drag.box.cx
+      const dyPx = sy.value - drag.box.cy
+      // Media position is the centre as a canvas fraction; text position places the block's
+      // top-left at (canvas - block) × fraction, so a pixel move spans canvas - block.
+      const spanX = drag.kind === 'text' ? W - drag.box.w : W
+      const spanY = drag.kind === 'text' ? H - drag.box.h : H
+      const fx = Math.abs(spanX) > 1 ? dxPx / spanX : 0
+      const fy = Math.abs(spanY) > 1 ? dyPx / spanY : 0
+      s.setClipTransform(drag.clipId, offsetTransform(drag.start, fx, fy))
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+      const drag = dragRef.current
+      dragRef.current = null
+      // One undo step for the whole gesture (the live updates above recorded none).
+      if (drag?.active) useProjectStore.getState().recordUndoPoint(drag.before)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
+  }
+
+  // Full screen: the whole preview block (canvas + transport) goes full screen; the button and
+  // Esc (handled by the browser) leave it.
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(document.fullscreenElement !== null && document.fullscreenElement === wrapRef.current)
+    document.addEventListener('fullscreenchange', onChange)
+    return () => document.removeEventListener('fullscreenchange', onChange)
+  }, [])
+  function toggleFullscreen() {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined)
+    else void wrapRef.current?.requestFullscreen().catch((err: unknown) => console.warn('[anycut preview] fullscreen refused', err))
+  }
+  // In full screen the transport fades out after a moment without pointer movement.
+  const idleTimerRef = useRef<number>(0)
+  function wakeControls() {
+    if (!isFullscreen) return
+    setControlsIdle(false)
+    window.clearTimeout(idleTimerRef.current)
+    idleTimerRef.current = window.setTimeout(() => setControlsIdle(true), FULLSCREEN_IDLE_MS)
+  }
+  useEffect(() => {
+    if (isFullscreen) wakeControls()
+    else {
+      window.clearTimeout(idleTimerRef.current)
+      setControlsIdle(false)
+    }
+    return () => window.clearTimeout(idleTimerRef.current)
+  }, [isFullscreen]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /**
    * What to draw for a clip's <video> this frame. A <video> has no frame to give while it's
@@ -358,6 +667,8 @@ export default function Preview() {
     let el = audioPoolRef.current.get(clip.id)
     if (!el) {
       el = document.createElement('audio')
+      // CORS-clean so it can feed a Web Audio gain node (volumes above 100%; see audioGain).
+      el.crossOrigin = 'anonymous'
       el.src = playableUrl(asset, clip)
       el.preload = 'auto'
       el.addEventListener('error', () => {
@@ -434,7 +745,17 @@ export default function Preview() {
     const keepPitch = !clip?.changeAudioPitch
     if (el.preservesPitch !== keepPitch) el.preservesPitch = keepPitch
     el.muted = shouldMute
-    el.volume = Math.min(Math.max(volume, 0), 1)
+    if (volume > 1 && el.crossOrigin === 'anonymous') {
+      // <audio>.volume stops at 1: louder than 100% (the timeline's volume line goes to 200%,
+      // like CapCut) goes through a Web Audio gain node, as export's volume filter does.
+      el.volume = 1
+      const g = audioGain(el)
+      if (g) g.gain.value = Math.min(volume, 4)
+    } else {
+      el.volume = Math.min(Math.max(volume, 0), 1)
+      const g = gainNodes.get(el)
+      if (g) g.gain.value = 1
+    }
     if (isPlaying) {
       if (el.paused) {
         // On (re)start, land on the right frame before playing so the first frame isn't stale.
@@ -516,6 +837,7 @@ export default function Preview() {
           if (err) drawMediaError(ctx, width, height, asset.name, err)
         }
       }
+      syncOverlay(state, state.playhead)
       rafRef.current = requestAnimationFrame(render)
       return
     }
@@ -551,6 +873,16 @@ export default function Preview() {
       // While a transition runs, each of the two clips draws into its own offscreen layer; they
       // are composited per transition type after the loop.
       const inTransition = activeTransition !== null && active.some((a) => a.layer !== undefined)
+      // Both clips stay audible through a transition: an equal-power crossfade (outgoing ×
+      // cos, incoming × sin of the progress), the same qsin curve export's afade uses.
+      const transitionGain = new Map<string, number>()
+      if (inTransition && activeTransition) {
+        const p = Math.min(Math.max(activeTransition.progress, 0), 1)
+        for (const a of active) {
+          if (a.layer === 0) transitionGain.set(a.clip.id, Math.cos((p * Math.PI) / 2))
+          else if (a.layer === 1) transitionGain.set(a.clip.id, Math.sin((p * Math.PI) / 2))
+        }
+      }
       for (const { clip, asset, alpha, layer } of active) {
         const target = inTransition && layer !== undefined ? getTransitionLayer(layer, width, height) ?? ctx : ctx
         if (state.missingAssetIds.includes(asset.id)) {
@@ -564,7 +896,10 @@ export default function Preview() {
         // interpolateTransform only drives x/y/scale/opacity; rotation/flipH are static, read
         // straight from the clip transform so the preview matches export.
         const tf = { ...interp, rotation: clip.transform.rotation ?? 0, flipH: clip.transform.flipH ?? false }
-        const finalAlpha = alpha * tf.opacity
+        // Fade handles: the clip fades from/to black on the main track (the canvas is black under
+        // it) and from/to transparent on overlays, and its sound with it, as in export.
+        const fade = clipFadeGain(clip, localT)
+        const finalAlpha = alpha * tf.opacity * fade
         if (asset.kind === 'image') {
           const img = getImageEl(asset)
           if (img.complete) drawContain(target, img, width, height, finalAlpha, tf, clip.effects, localT, clip.duration, clip.crop, clip.filter)
@@ -573,7 +908,8 @@ export default function Preview() {
         const video = getVideoEl(clip, asset)
         liveClipIds.add(clip.id)
         const desired = sourceTimeFor(clip, localT)
-        const mute = clip.muted || clip.volume <= 0 || active.length > 1
+        const mute = clip.muted || clip.volume <= 0
+        const volume = clip.volume * (transitionGain.get(clip.id) ?? 1) * fade
         // A clip lets its <video> free-run (no per-frame seeking — the .mov flicker fix) whenever
         // it plays forward: playing, not frozen, not reversed. A speed curve is piecewise-constant,
         // so it free-runs too, at the current segment's rate (clipSpeedAt); seeking every few
@@ -582,7 +918,7 @@ export default function Preview() {
         const nativeRate = clipSpeedAt(clip, localT)
         // Frozen clips hold a single source frame: seek there once, never actually play. Reversed
         // clips can't play (no negative playbackRate): they're seek-driven, element paused.
-        syncMediaElement(video, desired, asset.duration, state.isPlaying && !clip.frozen && !clip.reversed, mute, clip.volume, clip, asset.name, nativeRate, canFreeRun)
+        syncMediaElement(video, desired, asset.duration, state.isPlaying && !clip.frozen && !clip.reversed, mute, volume, clip, asset.name, nativeRate, canFreeRun)
         const frame = frameFor(clip.id, asset.id, video)
         if (frame) drawContain(target, frame, width, height, finalAlpha, tf, clip.effects, localT, clip.duration, clip.crop, clip.filter)
         if (video.readyState >= 2) {
@@ -646,7 +982,7 @@ export default function Preview() {
           asset.duration,
           state.isPlaying && !clip.frozen && !clip.reversed,
           clip.muted || clip.volume <= 0,
-          clip.volume,
+          clip.volume * clipFadeGain(clip, t - clip.start),
           clip,
           asset.name,
           nativeRate,
@@ -663,6 +999,8 @@ export default function Preview() {
     // Text overlays, drawn last (on top). Same renderer as the export's text overlay bake.
     drawTextLayer(ctx, project, t, width, height)
 
+    syncOverlay(state, t)
+
     rafRef.current = requestAnimationFrame(render)
   }
 
@@ -671,9 +1009,24 @@ export default function Preview() {
     return () => cancelAnimationFrame(rafRef.current)
   }, [])
 
+  const noFocus = (e: React.MouseEvent) => e.preventDefault() // keep Space for play/pause, not the button
+
   return (
-    <div className="preview-canvas-wrap">
+    <div
+      ref={wrapRef}
+      className={`preview-canvas-wrap ${isFullscreen ? 'is-fullscreen' : ''} ${controlsIdle ? 'controls-idle' : ''}`}
+      onPointerMove={wakeControls}
+    >
       <canvas ref={canvasRef} className="preview-canvas" />
+      <div ref={overlayRef} className="pv-overlay" onPointerDown={onOverlayPointerDown}>
+        <div ref={guideVRef} className="pv-guide pv-guide-v" style={{ display: 'none' }} />
+        <div ref={guideHRef} className="pv-guide pv-guide-h" style={{ display: 'none' }} />
+        <div ref={selBoxRef} className="pv-sel" style={{ display: 'none' }}>
+          {(['nw', 'ne', 'sw', 'se'] as const).map((c) => (
+            <div key={c} className={`pv-handle ${c}`} data-corner={c} />
+          ))}
+        </div>
+      </div>
       <div className="preview-controls">
         <button
           className="preview-skip"
@@ -705,6 +1058,34 @@ export default function Preview() {
         <div className="preview-time">
           {previewAsset ? `Preview · ${previewAsset.name} · ${formatMMSS(previewAsset.duration)}` : `${formatMMSS(playhead)} / ${formatMMSS(duration)}`}
         </div>
+      </div>
+      <div className="pv-tools">
+        {cropTarget && !isFullscreen && (
+          <button className="pv-tool" title="Crop" aria-label="Crop" onMouseDown={noFocus} onClick={() => useCropEditor.getState().open(cropTarget.id)}>
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M4 1.5V12h10.5" />
+              <path d="M1.5 4H12v10.5" />
+            </svg>
+          </button>
+        )}
+        <button
+          className="pv-tool pv-fullscreen"
+          title={isFullscreen ? 'Exit full screen (Esc)' : 'Full screen'}
+          aria-label={isFullscreen ? 'Exit full screen' : 'Full screen'}
+          aria-pressed={isFullscreen}
+          onMouseDown={noFocus}
+          onClick={toggleFullscreen}
+        >
+          {isFullscreen ? (
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M6 1.5V6H1.5M10 1.5V6h4.5M6 14.5V10H1.5M10 14.5V10h4.5" />
+            </svg>
+          ) : (
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M1.5 5.5v-4h4M14.5 5.5v-4h-4M1.5 10.5v4h4M14.5 10.5v4h-4" />
+            </svg>
+          )}
+        </button>
       </div>
     </div>
   )

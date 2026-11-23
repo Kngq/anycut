@@ -68,7 +68,8 @@ export default function CropDialog() {
     setFrame(null)
     if (!media || !asset) return
     let cancelled = false
-    const src = window.api.fileUrl(media.sourceOverride?.previewPath ?? asset.previewPath ?? asset.path)
+    // Same file the preview plays: a baked stand-in (e.g. background removed) wins, then the proxy.
+    const src = window.api.fileUrl(media.sourceOverride ? (media.sourceOverride.previewPath ?? media.sourceOverride.path) : (asset.previewPath ?? asset.path))
     if (asset.kind === 'image') {
       const img = new Image()
       img.crossOrigin = 'anonymous'

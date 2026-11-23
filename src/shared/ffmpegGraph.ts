@@ -310,8 +310,24 @@ export function buildFfmpegPlan(inputProject: Project, opts: { textOverlay?: Tex
   function trimmedSegmentLabel(clip: MediaClip, asset: MediaAsset, finish: 'canvas' | 'native' = 'canvas'): string {
     const finishFilter = finish === 'native' ? `setsar=1,fps=${fps}` : scalePadFor()
     const base = buildBaseSegment(clip, asset, finishFilter)
-    if (finish === 'canvas') return applyEffectsChain(applyCanvasTransform(applyRotateFlip(base, clip, 'canvas'), clip), clip)
-    return applyRotateFlip(applyEffectsChain(base, clip), clip, 'native')
+    if (finish === 'canvas') return applyClipFade(applyEffectsChain(applyCanvasTransform(applyRotateFlip(base, clip, 'canvas'), clip), clip), clip, 'canvas')
+    return applyClipFade(applyRotateFlip(applyEffectsChain(base, clip), clip, 'native'), clip, 'native')
+  }
+
+  /** The clip's fade in / out (timeline corner handles): to black on the main track, to transparent
+   *  on an overlay. Runs on the clip's own segment (its timestamps start at 0), linear like the
+   *  preview's clipFadeGain. */
+  function applyClipFade(label: string, clip: MediaClip, finish: 'canvas' | 'native'): string {
+    const fi = Math.min(clip.fadeIn ?? 0, clip.duration)
+    const fo = Math.min(clip.fadeOut ?? 0, clip.duration)
+    if (fi <= 0 && fo <= 0) return label
+    const alpha = finish === 'native' ? ':alpha=1' : ''
+    const parts: string[] = finish === 'native' ? ['format=yuva420p'] : []
+    if (fi > 0) parts.push(`fade=t=in:st=0:d=${fi}${alpha}`)
+    if (fo > 0) parts.push(`fade=t=out:st=${Math.max(0, clip.duration - fo)}:d=${fo}${alpha}`)
+    const out = nextLabel('fade')
+    filters.push(`[${label}]${parts.join(',')}[${out}]`)
+    return out
   }
 
   /**
@@ -695,6 +711,40 @@ export function buildFfmpegPlan(inputProject: Project, opts: { textOverlay?: Tex
   // ---- Audio: mix audio-track clips + un-muted video-clip audio ----
   const audioMixLabels: string[] = []
 
+  // Main-roll transitions crossfade the audio too (preview does the same): each clip's audio is
+  // still placed at its own `start` — the incoming clip already overlaps the outgoing one by the
+  // transition length (see repackVideoTrack) — and the overlap gets an equal-power fade (qsin)
+  // out on the outgoing clip and in on the incoming one, so the sum stays level and the total
+  // length matches the xfade'd video. A transition next to a deactivated clip has nothing to
+  // fade against (preview plays the live clip at full volume), so it gets no fade.
+  const audioFades = new Map<string, { in?: number; out?: number }>()
+  if (primaryTrack) {
+    const rollClips = sortedClips<MediaClip>(primaryTrack).filter((c) => c.kind === 'media')
+    for (let i = 1; i < rollClips.length; i++) {
+      const clip = rollClips[i]
+      const prev = rollClips[i - 1]
+      if (!clip.transitionIn || clip.transitionIn.duration <= 0 || clip.disabled || prev.disabled) continue
+      const d = Math.min(clip.transitionIn.duration, prev.duration, clip.duration)
+      if (d <= 0) continue
+      audioFades.set(clip.id, { ...audioFades.get(clip.id), in: d })
+      audioFades.set(prev.id, { ...audioFades.get(prev.id), out: d })
+    }
+  }
+  /** `afade=…,` for a clip's transition fades (clip-local time, after speed/reverse), or ''. */
+  function fadePrefix(clip: MediaClip): string {
+    const f = audioFades.get(clip.id)
+    // The clip's own fade handles (linear), then any transition crossfade (equal-power).
+    const ui = Math.min(clip.fadeIn ?? 0, clip.duration)
+    const uo = Math.min(clip.fadeOut ?? 0, clip.duration)
+    let chain = ''
+    if (ui > 0) chain += `afade=t=in:st=0:d=${ui},`
+    if (uo > 0) chain += `afade=t=out:st=${Math.max(0, clip.duration - uo)}:d=${uo},`
+    if (!f) return chain
+    if (f.in) chain += `afade=t=in:st=0:d=${f.in}:curve=qsin,`
+    if (f.out) chain += `afade=t=out:st=${Math.max(0, clip.duration - f.out)}:d=${f.out}:curve=qsin,`
+    return chain
+  }
+
   function addAudioClip(clip: MediaClip, asset: MediaAsset) {
     if (clip.disabled || !asset.hasAudio || clip.muted || clip.volume <= 0) return
     // An overridden clip (e.g. background removed) still plays the ORIGINAL file's audio.
@@ -706,7 +756,7 @@ export function buildFfmpegPlan(inputProject: Project, opts: { textOverlay?: Tex
     if (segments.length === 1 && segments[0].speed === 1 && !clip.reversed) {
       filters.push(
         `[${ref.index}:a]atrim=start=${segments[0].start}:end=${segments[0].end},asetpts=PTS-STARTPTS,` +
-          `volume=${clip.volume},adelay=${delayMs}|${delayMs}[${trimmed}]`
+          `${fadePrefix(clip)}volume=${clip.volume},adelay=${delayMs}|${delayMs}[${trimmed}]`
       )
       audioMixLabels.push(trimmed)
       return
@@ -748,7 +798,7 @@ export function buildFfmpegPlan(inputProject: Project, opts: { textOverlay?: Tex
       concatLabel = revLabel
     }
 
-    filters.push(`[${concatLabel}]volume=${clip.volume},adelay=${delayMs}|${delayMs}[${trimmed}]`)
+    filters.push(`[${concatLabel}]${fadePrefix(clip)}volume=${clip.volume},adelay=${delayMs}|${delayMs}[${trimmed}]`)
     audioMixLabels.push(trimmed)
   }
 

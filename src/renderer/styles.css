@@ -536,18 +536,28 @@ canvas.preview-canvas {
 .timeline-wrap {
   background: var(--bg-1);
   border-top: 1px solid var(--border);
+  position: relative;
+  /* The toolbar stays put; only .timeline-scroll below it scrolls. */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.timeline-scroll {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   position: relative;
 }
 
 .timeline-toolbar {
   display: flex;
+  flex: none;
   gap: 6px;
   align-items: center;
   padding: 6px 8px;
   border-bottom: 1px solid var(--border);
-  position: sticky;
-  left: 0;
 }
 
 .tl-tools {
@@ -630,7 +640,10 @@ canvas.preview-canvas {
 
 .ruler {
   height: 24px;
-  position: relative;
+  /* Always visible: sticks to the top of the scroll area while the tracks scroll under it. */
+  position: sticky;
+  top: 0;
+  z-index: 13;
   border-bottom: 1px solid var(--border);
   background: var(--bg-2);
 }
@@ -864,9 +877,110 @@ canvas.preview-canvas {
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 6px;
+  width: 12px;
   z-index: 3;
   cursor: ew-resize;
+}
+
+/* A grip appears on hover so the edge is easy to find. */
+.clip .trim-handle::after {
+  content: '';
+  position: absolute;
+  top: 25%;
+  bottom: 25%;
+  width: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.85);
+  opacity: 0;
+  transition: opacity 80ms;
+}
+
+.clip .trim-handle.left::after {
+  left: 2px;
+}
+
+.clip .trim-handle.right::after {
+  right: 2px;
+}
+
+.clip .trim-handle:hover::after {
+  opacity: 1;
+}
+
+.clip.drag-source {
+  opacity: 0.35;
+}
+
+/* Audio clips: CapCut's draggable volume line (middle = 100%). */
+.volume-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 9px;
+  margin-top: -4px;
+  z-index: 2;
+  cursor: ns-resize;
+}
+
+.volume-line::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 4px;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.75);
+}
+
+.volume-line:hover::before,
+.volume-line.active::before {
+  height: 2px;
+  background: #fff;
+}
+
+.volume-chip {
+  position: absolute;
+  right: 6px;
+  top: -18px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+/* "New track" drop ghost: an insertion line above the top video row plus the clip outline. */
+.new-track-ghost {
+  position: absolute;
+  left: 90px;
+  right: 0;
+  height: 3px;
+  background: rgba(190, 190, 198, 0.9);
+  z-index: 11;
+  pointer-events: none;
+}
+
+.new-track-ghost-clip {
+  position: absolute;
+  top: -13px;
+  height: 28px;
+  margin-left: -90px;
+  border-radius: 5px;
+  border: 1px dashed rgba(255, 255, 255, 0.7);
+  background: rgba(150, 150, 158, 0.45);
+  display: flex;
+  align-items: center;
+  padding-left: 6px;
+}
+
+.timeline-marquee {
+  position: absolute;
+  z-index: 11;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  pointer-events: none;
 }
 
 .clip .trim-handle.left {
@@ -888,9 +1002,10 @@ canvas.preview-canvas {
 }
 
 .playhead-handle {
-  /* An 18×24 grab area (the line itself stays click-through); the triangle is the ::after. */
+  /* Lives in the sticky ruler. An 18×24 grab area; the triangle is the ::after. */
   position: absolute;
   top: 0;
+  z-index: 1;
   width: 18px;
   height: 24px;
   margin-left: -9px;
@@ -1365,6 +1480,33 @@ canvas.preview-canvas {
 
 .toast-message {
   flex: 1;
+}
+
+.toast-success {
+  border-color: #2f8f5e;
+  background: #15241d;
+}
+
+.toast-icon {
+  flex: none;
+  color: #4ccf8a;
+  margin-top: 1px;
+}
+
+.toast-action {
+  flex: none;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.toast-action:hover {
+  background: rgba(255, 255, 255, 0.16);
 }
 
 .toast-close {
@@ -2128,16 +2270,13 @@ input[type='range']:disabled::-webkit-slider-thumb {
   opacity: 0.92;
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.7), 0 4px 14px rgba(0, 0, 0, 0.45);
   pointer-events: none;
-  transition: left 60ms linear;
 }
 
 /* Lifted a step above the clip colour so the ghost reads clearly where it overlaps a clip. */
-.drop-ghost.video {
-  background: color-mix(in srgb, var(--track-video) 80%, #fff 20%);
-}
-
+/* Ghosts are neutral grey: they mark a place, the dragged clip itself keeps its colour. */
+.drop-ghost.video,
 .drop-ghost.audio {
-  background: color-mix(in srgb, var(--track-audio) 80%, #fff 20%);
+  background: rgba(150, 150, 158, 0.55);
 }
 
 .drop-ghost-chips {
@@ -2176,7 +2315,7 @@ input[type='range']:disabled::-webkit-slider-thumb {
 }
 
 .playhead.snapped,
-.playhead.snapped .playhead-handle::after {
+.playhead-handle.snapped::after {
   background: var(--drop-accent);
 }
 
@@ -2887,3 +3026,89 @@ input[type='range'].tl-zoom {
   text-overflow: ellipsis;
 }
 /* ── end Filters tab ── */
+
+
+/* Media pool: selection and drag-rectangle. */
+.asset-area {
+  position: relative;
+  min-height: 240px;
+  padding-bottom: 24px;
+}
+
+.asset-card.selected .asset-thumb {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+.bin-marquee {
+  position: absolute;
+  z-index: 5;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  pointer-events: none;
+}
+
+.media-bin:focus {
+  outline: none;
+}
+
+/* The clip being dragged, following the cursor above the lanes (under the label column). */
+.clip.drag-float {
+  z-index: 11;
+  opacity: 0.9;
+  pointer-events: none;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+}
+
+/* Fade handles + shading (CapCut): dots at the top corners, dragged inward to fade. */
+.fade-shade {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.fade-shade polygon {
+  fill: rgba(0, 0, 0, 0.38);
+  stroke: rgba(255, 255, 255, 0.55);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.fade-handle {
+  position: absolute;
+  top: 3px;
+  width: 9px;
+  height: 9px;
+  margin: 0 -1px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+  z-index: 4;
+  cursor: ew-resize;
+  opacity: 0;
+  transition: opacity 80ms;
+}
+
+.clip:hover .fade-handle,
+.clip.selected .fade-handle,
+.fade-handle.set,
+.fade-handle.active {
+  opacity: 1;
+}
+
+.fade-chip {
+  position: absolute;
+  top: 2px;
+  z-index: 5;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: 10px;
+  line-height: 15px;
+  pointer-events: none;
+  white-space: nowrap;
+}

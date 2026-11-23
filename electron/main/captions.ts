@@ -5,6 +5,7 @@ import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { app, utilityProcess, type UtilityProcess } from 'electron'
 import { ffmpegPath } from './binaries'
+import { whisperModelReady } from './whisperModel'
 import type { CaptionProgress, CaptionResult, CaptionStatus } from '@shared/ipc'
 import type { CaptionSource, CaptionWord } from '@shared/captions'
 
@@ -17,8 +18,6 @@ import type { CaptionSource, CaptionWord } from '@shared/captions'
  */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const MODEL_DIR = 'onnx-community/whisper-base_timestamped'
-const MODEL_FILES = ['onnx/encoder_model.onnx', 'onnx/decoder_model_merged_quantized.onnx', 'tokenizer.json']
 
 function cacheDir(): string {
   return path.join(app.getPath('userData'), 'models', 'transformers')
@@ -32,8 +31,7 @@ async function exists(p: string): Promise<boolean> {
 }
 
 export async function captionStatus(): Promise<CaptionStatus> {
-  const present = await Promise.all(MODEL_FILES.map((f) => exists(path.join(cacheDir(), MODEL_DIR, f))))
-  return { modelDownloaded: present.every(Boolean), modelName: 'Whisper base (multilingual)', modelSizeMB: 136 }
+  return { modelDownloaded: await whisperModelReady(cacheDir()), modelName: 'Whisper base (multilingual)', modelSizeMB: 136 }
 }
 
 // ---- Worker lifecycle: one long-lived worker keeps the model in memory between runs. ----

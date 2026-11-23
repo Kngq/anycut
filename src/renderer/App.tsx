@@ -48,13 +48,40 @@ export default function App() {
 
   useEffect(() => {
     if (view !== 'editor') return
+    /** Text entry only: Space and shortcuts still work with a button, slider or clip focused. */
+    function isTextEntry(el: HTMLElement | null): boolean {
+      if (!el) return false
+      if (el.isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') return true
+      if (el.tagName !== 'INPUT') return false
+      return !['range', 'checkbox', 'radio', 'button', 'submit', 'reset', 'color', 'file'].includes((el as HTMLInputElement).type)
+    }
     function onKeyDown(e: KeyboardEvent) {
       const target = e.target as HTMLElement | null
+      // Space always plays / pauses the preview, whatever has focus (a clip, a button, the
+      // timeline's scroll area), except while typing. Handled in the capture phase so a focused
+      // button can't "click" and the timeline can't scroll on it.
+      if (e.code === 'Space' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (isTextEntry(target)) return
+        e.preventDefault()
+        e.stopPropagation()
+        if (e.repeat) return
+        const s = store()
+        s.setIsPlaying(!s.isPlaying)
+        return
+      }
       // Don't hijack typing in form fields.
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable)) {
         return
       }
       const mod = e.metaKey || e.ctrlKey
+      if (mod && !e.shiftKey && !e.altKey && e.code === 'KeyA') {
+        // ⌘A / Ctrl+A selects every clip on the timeline (in the media pool: all media, see MediaBin).
+        if (target?.closest('.media-bin')) return
+        e.preventDefault()
+        const s = store()
+        s.setSelection(s.project.tracks.flatMap((t) => t.clips.map((c) => c.id)))
+        return
+      }
       if (mod && (e.key === 'z' || e.key === 'Z')) {
         // Cmd+Z = undo, Cmd+Shift+Z = redo.
         e.preventDefault()
@@ -84,10 +111,9 @@ export default function App() {
         const end = projectDuration(s.project)
         if (s.isPlaying) setIsPlaying(false)
         s.setPlayhead(Math.min(Math.max(frame / fps, 0), Math.max(end, 0)))
-      } else if (e.code === 'Space') {
-        e.preventDefault()
-        setIsPlaying(!isPlaying)
       } else if (e.key === 'Backspace' || e.key === 'Delete') {
+        // In the media pool, Delete removes the selected media (MediaBin handles it).
+        if (target?.closest('.media-bin')) return
         store().deleteSelection()
       } else if (mod && e.altKey && e.code === 'KeyC') {
         // ⌥⌘C / ⌥⌘V = copy / paste attributes (before plain ⌘C/⌘V).
@@ -128,8 +154,16 @@ export default function App() {
         if (selectedClipId) store().trimClipToPlayhead(selectedClipId, e.code === 'KeyQ' ? 'start' : 'end')
       }
     }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
+    // Key-up too: a focused <button> fires its click on Space's key-up.
+    function onKeyUp(e: KeyboardEvent) {
+      if (e.code === 'Space' && !isTextEntry(e.target as HTMLElement | null)) e.preventDefault()
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    window.addEventListener('keyup', onKeyUp, true)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true)
+      window.removeEventListener('keyup', onKeyUp, true)
+    }
   }, [view, isPlaying, selectedClipId, setIsPlaying, splitClipAtPlayhead, removeClip, undo, redo, toggleClipFlipH, rotateClip])
 
   if (view === 'home') {

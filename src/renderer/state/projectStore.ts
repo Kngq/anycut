@@ -141,7 +141,7 @@ interface ProjectState {
   /** Patches one numeric param of one effect instance. */
   updateClipEffectParam: (clipId: string, effectId: string, key: string, value: number) => void
   updateTextClip: (clipId: string, patch: Record<string, unknown>) => void
-  updateMediaClipProps: (clipId: string, patch: Partial<Pick<MediaClip, 'volume' | 'muted' | 'changeAudioPitch'>>) => void
+  updateMediaClipProps: (clipId: string, patch: Partial<Pick<MediaClip, 'volume' | 'muted' | 'changeAudioPitch' | 'fadeIn' | 'fadeOut'>>) => void
   /** Animation tab: replaces the clip's In/Out/Combo presets. `record` = add an undo step
    *  (off while a duration slider is being dragged). */
   setClipAnimations: (clipId: string, animations: MediaClip['animations'], record?: boolean) => void
@@ -155,6 +155,13 @@ interface ProjectState {
   selectClip: (clipId: string | null) => void
   /** Cmd/Shift-click: adds or removes a clip (and its group) from the selection. */
   toggleClipSelection: (clipId: string) => void
+  /** Replaces the selection (timeline marquee). Groups expand; the last id becomes primary. */
+  setSelection: (clipIds: string[]) => void
+  /** Moves a clip onto a brand-new video track (above the others) at `start`: what dropping a
+   *  video on top of another video does. */
+  moveClipToNewTrack: (clipId: string, start: number) => void
+  /** Adds `asset` on a brand-new video track at `start`. */
+  addMediaClipToNewTrack: (asset: MediaAsset, start: number) => void
   copySelection: () => void
   cutSelection: () => void
   paste: () => void
@@ -309,6 +316,7 @@ function splitMediaClipHalves(clip: MediaClip, firstDuration: number): { first: 
   const speed = hasCurve ? 1 : clip.speed
   const secondBase = {
     ...clip,
+    fadeIn: undefined,
     id: uuid(),
     start: clip.start + firstDuration,
     duration: secondDuration,
@@ -320,12 +328,12 @@ function splitMediaClipHalves(clip: MediaClip, firstDuration: number): { first: 
   }
   if (clip.reversed) {
     return {
-      first: { ...clip, duration: firstDuration, trimIn: splitSource, trimOut: clip.trimOut, speed, speedKeyframes: undefined, speedCurvePoints: undefined, speedCurvePreset: undefined },
+      first: { ...clip, fadeOut: undefined, duration: firstDuration, trimIn: splitSource, trimOut: clip.trimOut, speed, speedKeyframes: undefined, speedCurvePoints: undefined, speedCurvePreset: undefined },
       second: { ...secondBase, trimIn: clip.trimIn, trimOut: splitSource }
     }
   }
   return {
-    first: { ...clip, duration: firstDuration, trimOut: splitSource, speed, speedKeyframes: undefined, speedCurvePoints: undefined, speedCurvePreset: undefined },
+    first: { ...clip, fadeOut: undefined, duration: firstDuration, trimOut: splitSource, speed, speedKeyframes: undefined, speedCurvePoints: undefined, speedCurvePreset: undefined },
     second: { ...secondBase, trimIn: splitSource, trimOut: clip.trimOut }
   }
 }
@@ -479,13 +487,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         }
         return repackVideoTrack(s.project, { ...t, clips })
       })
-      // When the timeline becomes "long" (>= LONG_TIMELINE_SECONDS), snap to minimum zoom so the
-      // whole thing fits. Setting pxPerSecond to 1 lands below the Timeline's dynamic floor; the
-      // Timeline's clamp effect then pulls it up to exactly the "half the timeline" minimum, and
-      // the adaptive ruler switches to a minute scale at that zoom. We only ever drop zoom here
-      // (never raise it), so a user who's zoomed in on a short project isn't disturbed.
-      const zoomPatch = projectDuration(project) >= LONG_TIMELINE_SECONDS ? { pxPerSecond: 1 } : {}
-      return { project, dirty: true, selectedClipId: clip.id, ...zoomPatch, ...recordPast(s) }
+      // The timeline zoom is the user's alone (only Cmd/Ctrl+scroll or the zoom slider change it).
+      return { project, dirty: true, selectedClipId: clip.id, ...recordPast(s) }
     }),
 
   addTextClipToTrack: (trackId, start) =>
@@ -1101,6 +1104,54 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       selectedClipIds: clipId ? ops.expandGroups(s.project, [clipId]) : [],
       previewAssetId: clipId ? null : s.previewAssetId
     })),
+
+  setSelection: (clipIds) =>
+    set((s) => {
+      const ids = ops.expandGroups(s.project, clipIds)
+      return { selectedClipIds: ids, selectedClipId: ids.length ? clipIds[clipIds.length - 1] ?? ids[ids.length - 1] : null, previewAssetId: ids.length ? null : s.previewAssetId }
+    }),
+
+  moveClipToNewTrack: (clipId, start) =>
+    set((s) => {
+      const found = findClip(s.project, clipId)
+      if (!found || found.track.type !== 'video') return {}
+      const count = s.project.tracks.filter((t) => t.type === 'video').length + 1
+      const track: Track = { id: uuid(), type: 'video', name: `Video ${count}`, clips: [], muted: false, hidden: false }
+      const withTrack = { ...s.project, tracks: [...s.project.tracks, track] }
+      const moved = { ...found.clip, start: Math.max(0, start), trackId: track.id, transitionIn: undefined } as Clip
+      const tracks = withTrack.tracks.map((t) => {
+        if (t.id === found.track.id) return repackVideoTrack(withTrack, { ...t, clips: t.clips.filter((c) => c.id !== clipId) })
+        if (t.id === track.id) return repackVideoTrack(withTrack, { ...t, clips: [moved] })
+        return t
+      })
+      return { project: touch({ ...withTrack, tracks }), dirty: true, selectedClipId: clipId, ...recordPast(s) }
+    }),
+
+  addMediaClipToNewTrack: (asset, start) =>
+    set((s) => {
+      const count = s.project.tracks.filter((t) => t.type === 'video').length + 1
+      const track: Track = { id: uuid(), type: 'video', name: `Video ${count}`, clips: [], muted: false, hidden: false }
+      const duration = asset.kind === 'image' ? 5 : asset.duration
+      const clip: MediaClip = {
+        id: uuid(),
+        kind: 'media',
+        trackId: track.id,
+        start: Math.max(0, start),
+        duration,
+        trimIn: 0,
+        trimOut: asset.kind === 'image' ? duration : asset.duration,
+        assetId: asset.id,
+        volume: 1,
+        muted: false,
+        speed: 1,
+        reversed: false,
+        frozen: false,
+        transform: defaultTransform()
+      }
+      const withTrack = { ...s.project, tracks: [...s.project.tracks, track] }
+      const tracks = withTrack.tracks.map((t) => (t.id === track.id ? repackVideoTrack(withTrack, { ...t, clips: [clip] }) : t))
+      return { project: touch({ ...withTrack, tracks }), dirty: true, selectedClipId: clip.id, selectedClipIds: [clip.id], ...recordPast(s) }
+    }),
 
   toggleClipSelection: (clipId) =>
     set((s) => {

@@ -760,3 +760,43 @@ Measured in the app (1080p, GOP 250): reversed 43% → 0% black frames, curve 7%
   - Smaller Vision input: no gain.
   - Two Vision helpers in parallel: 25% faster, not worth the frame-split complexity.
 - **Mask quality:** not yet compared against MODNet on real footage of people (no non-personal test clip with a person available).
+
+## Editing feel pass (2026-11-22)
+
+**Timeline (Timeline.tsx)**
+- The toolbar sits outside the scroll area (`.timeline-scroll`), and the ruler is `position: sticky; top: 0`. The playhead handle now lives in the ruler.
+- **Zoom** is only ever changed by the user: ⌘/Ctrl+wheel (and pinch) zooms around the time under the pointer, or the zoom slider. Adding clips no longer snaps the zoom, and the min-zoom clamp effect is gone.
+- **Clip drags** resolve a live `ClipDropTarget` (`resolveClipDrag`):
+  - On the main track, the clips part to show the gap (`gapShift`, animated while `.timeline-body.parting`) and a ghost marks the slot.
+  - Free tracks get a snapped ghost.
+  - A video dropped on top of another video on an overlay track, or onto a text row, goes to a new overlay track: a `.new-track-ghost` insertion line, then `moveClipToNewTrack` / `addMediaClipToNewTrack` in the store.
+  - Bin drags use the same ghost and gap logic.
+- **Trim** follows the pointer's travel, not its absolute position:
+  - A 3 px dead zone, snapping to edges and the playhead within 8 px (⌘ disables it), and one undo step.
+  - It fixes the main-track start trim, which re-applied the whole drag on every move.
+  - Handles are 12 px with a hover grip; audio clips can be trimmed too.
+- **Audio clips** have a CapCut-style volume line: middle = 100%, top = 200%. The waveform scales with it, and the Inspector volume now goes to 200%. The preview plays volumes above 100% through a Web Audio gain node (`audioGain` in Preview.tsx).
+- **Rectangle selection:** dragging on an empty lane selects (`setSelection`).
+- **Media bin:** rectangle selection, ⇧/⌘-click to add to the selection, and Delete to remove. Dragging a selected item drags all of them (`activeAssetDragIds`), and they are dropped back to back.
+
+**Keys**
+- Space is handled in the capture phase and always plays/pauses, except in text fields. Key-up is suppressed so a focused button doesn't click.
+
+**Captions**
+- `electron/main/whisperModel.ts` downloads and size-verifies the Whisper files (temp file → rename, manifest last). The worker then loads only from that folder (`allowRemoteModels = false`).
+- This fixes "Protobuf parsing failed" from a truncated encoder_model.onnx that transformers.js had cached: 49.7 of 82.5 MB.
+
+**Preview (preview-agent work)**
+- Click to select / drag to move / corner-scale in the preview, with centre snapping (`src/shared/transformEdit.ts`, `preview.css`).
+- A Crop row in the Inspector plus a crop button in the preview.
+- A full-screen button.
+- Transitions crossfade the audio: equal power in preview, and `afade` in/out with `qsin` in export (`scripts/testExportTransitionAudio.ts`).
+- **Follow-ups:**
+  - ⌘/Ctrl+A selects all clips, or all media when the media pool has focus.
+  - A dragged clip floats glued to the cursor (`.drag-float`); ghosts are grey and the gap animations were removed (no lag).
+  - Fade handles: `MediaClip.fadeIn` / `fadeOut` (timeline seconds), set by the corner dots with a shaded triangle.
+    - Preview multiplies opacity and volume by `clipFadeGain`.
+    - Export uses `fade` (to black on the main track; `alpha=1` on overlays) plus linear `afade`.
+    - Split keeps fade-in on the first half and fade-out on the second.
+    - Covered by `scripts/testExportFades.ts`.
+  - The export finish shows a success toast with "Show in Finder" (toasts gained `success` and an action button).

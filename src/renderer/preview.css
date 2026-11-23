@@ -1,0 +1,135 @@
+/* Preview: on-canvas selection (move / scale), the right-hand tool buttons (crop, full screen)
+   and full-screen mode. Kept apart from styles.css; imported by components/Preview.tsx. */
+
+/* Sits exactly over the canvas's drawn area (positioned from the render loop). */
+.pv-overlay {
+  position: absolute;
+  z-index: 1;
+  overflow: visible;
+  touch-action: none;
+  user-select: none;
+}
+
+/* Selected clip: thin white outline with round corner handles (CapCut's player selection). */
+.pv-sel {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  cursor: move;
+  transform-origin: 50% 50%;
+}
+
+.pv-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35), 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+.pv-handle.nw { left: 0; top: 0; cursor: nwse-resize; }
+.pv-handle.ne { left: 100%; top: 0; cursor: nesw-resize; }
+.pv-handle.sw { left: 0; top: 100%; cursor: nesw-resize; }
+.pv-handle.se { left: 100%; top: 100%; cursor: nwse-resize; }
+
+/* Centre guide shown while a dragged clip's centre is snapped to it. */
+.pv-guide {
+  position: absolute;
+  pointer-events: none;
+  background: var(--accent);
+}
+.pv-guide-v { top: 0; bottom: 0; width: 1px; margin-left: -0.5px; }
+.pv-guide-h { left: 0; right: 0; height: 1px; margin-top: -0.5px; }
+
+.preview-canvas-wrap .preview-controls {
+  z-index: 3;
+}
+
+/* Crop / full-screen buttons, bottom right of the player. */
+.pv-tools {
+  position: absolute;
+  z-index: 3;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 4px;
+  border-radius: 6px;
+  background: rgba(20, 24, 30, 0.6);
+}
+
+.pv-tool {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.pv-tool:hover {
+  background: var(--bg-3);
+  color: #fff;
+}
+
+/* ---- Full screen: the whole player (canvas + transport) fills the screen, letterboxed on black. */
+.preview-canvas-wrap:fullscreen {
+  background: #000;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+}
+.preview-canvas-wrap:fullscreen canvas.preview-canvas {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+  border: none;
+}
+/* No editing in full screen: playback only. */
+.preview-canvas-wrap:fullscreen .pv-overlay {
+  display: none;
+}
+.preview-canvas-wrap:fullscreen .preview-controls {
+  bottom: 24px;
+  padding: 6px 12px;
+  background: rgba(20, 24, 30, 0.75);
+}
+.preview-canvas-wrap:fullscreen .pv-tools {
+  right: 24px;
+  bottom: 24px;
+  background: rgba(20, 24, 30, 0.75);
+}
+.preview-canvas-wrap .preview-controls,
+.preview-canvas-wrap .pv-tools {
+  transition: opacity 0.25s ease;
+}
+.preview-canvas-wrap:fullscreen.controls-idle {
+  cursor: none;
+}
+.preview-canvas-wrap:fullscreen.controls-idle .preview-controls,
+.preview-canvas-wrap:fullscreen.controls-idle .pv-tools {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Inspector > Transform > Crop row (lives here to keep styles.css untouched). */
+.insp-crop-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.insp-crop-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}

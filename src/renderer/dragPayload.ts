@@ -47,15 +47,24 @@ export function readFxPayload(dt: DataTransfer): DragPayload | null {
  * can't be read until `drop`.
  */
 let activeAsset: string | null = null
+/** Every asset in the drag when several bin items are selected (the first is `activeAsset`). */
+let activeAssets: string[] = []
 
-export function startAssetDrag(assetId: string) {
+export function startAssetDrag(assetId: string, all: string[] = [assetId]) {
   activeAsset = assetId
+  activeAssets = all.includes(assetId) ? [assetId, ...all.filter((id) => id !== assetId)] : [assetId]
 }
 
 export function activeAssetDragId(): string | null {
   return activeAsset
 }
 
+/** All assets being dragged, in drop order (the grabbed one first). */
+export function activeAssetDragIds(): string[] {
+  return activeAsset ? activeAssets : []
+}
+
 export function endAssetDrag() {
   activeAsset = null
+  activeAssets = []
 }

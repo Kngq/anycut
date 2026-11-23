@@ -9,3 +9,4 @@ dist-electron/
 capcutcopy/
 release/
 native-bin/
+.scratch-effects-export/

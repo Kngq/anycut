@@ -9,6 +9,7 @@ import MotionBlurSection from './MotionBlurSection'
 import { filterDef } from '@shared/filters'
 import { animationsOfKind, poseAt, type AnimationDef, type AnimationKind } from '@shared/animations'
 import StorageSection from './StorageSection'
+import { useCropEditor } from './CropDialog'
 import {
   COLOR_SPACES,
   EFFECT_CATALOG,
@@ -16,6 +17,7 @@ import {
   TRANSITION_CATALOG,
   aspectPresetFor,
   effectCatalogEntry,
+  isFullCrop,
   projectDuration,
   type ClipEffect,
   type ClipEffectType,
@@ -111,7 +113,16 @@ function AxisField({ axis, value, onChange, unit }: { axis: string; value: numbe
  *  Static values only (no keyframe editor); touching a control drops any legacy keyframes so
  *  nothing keeps animating that the UI can't show. Position is shown the way CapCut shows it:
  *  pixels from the canvas centre, Y up. */
-function TransformSections({ transform, onChange }: { transform: ClipTransform; onChange: (t: ClipTransform) => void }) {
+function TransformSections({
+  transform,
+  onChange,
+  crop
+}: {
+  transform: ClipTransform
+  onChange: (t: ClipTransform) => void
+  /** Media clips only: the Crop row (opens the crop editor; reset when cropped). */
+  crop?: { cropped: boolean; onEdit: () => void; onReset: () => void }
+}) {
   const canvas = useProjectStore((s) => s.project.canvas)
   const set = (patch: Partial<ClipTransform>) => onChange({ ...transform, ...patch, keyframes: undefined })
   const pct = { format: (v: number) => String(Math.round(v * 100)), parse: (s: string) => Number(s) / 100, unit: '%' }
@@ -141,6 +152,21 @@ function TransformSections({ transform, onChange }: { transform: ClipTransform; 
             valueBox={{ format: (v) => String(Math.round(v)), unit: '°' }}
           />
         </div>
+        {crop && (
+          <div className="field-row prop-row">
+            <label>Crop</label>
+            <div className="insp-crop-row">
+              <button className="insp-crop-btn" onClick={crop.onEdit} title="Open the crop editor">
+                <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M4 1.5V12h10.5" />
+                  <path d="M1.5 4H12v10.5" />
+                </svg>
+                {crop.cropped ? 'Edit crop' : 'Crop'}
+              </button>
+              {crop.cropped && <ResetButton title="Reset crop" onClick={crop.onReset} />}
+            </div>
+          </div>
+        )}
       </Section>
       <Section title="Blend" action={<ResetButton title="Reset opacity" onClick={() => set({ opacity: 1 })} />}>
         <div className="field-row prop-row">
@@ -366,6 +392,7 @@ export default function Inspector() {
   const setClipSpeedKeyframes = useProjectStore((s) => s.setClipSpeedKeyframes)
   const setClipReversed = useProjectStore((s) => s.setClipReversed)
   const setClipTransform = useProjectStore((s) => s.setClipTransform)
+  const setClipCrop = useProjectStore((s) => s.setClipCrop)
   const setColorSpace = useProjectStore((s) => s.setColorSpace)
   const setClipFilter = useProjectStore((s) => s.setClipFilter)
 
@@ -566,7 +593,11 @@ export default function Inspector() {
         <>
           {track.type === 'video' && asset?.kind !== 'audio' && (
             <>
-              <TransformSections transform={clip.transform} onChange={(t) => setClipTransform(clip.id, t)} />
+              <TransformSections
+                transform={clip.transform}
+                onChange={(t) => setClipTransform(clip.id, t)}
+                crop={{ cropped: !isFullCrop(clip.crop), onEdit: () => useCropEditor.getState().open(clip.id), onReset: () => setClipCrop(clip.id, undefined) }}
+              />
               {clip.filter && filterDef(clip.filter.id) && (
                 <Section
                   title="Filter"
@@ -599,7 +630,7 @@ export default function Inspector() {
           <Section title="Audio">
             <div className="field-row prop-row">
               <label>Volume</label>
-              <Slider min={0} max={1} step={0.01} value={clip.volume} onChange={(v) => updateMediaClipProps(clip.id, { volume: v })} valueBox={{ format: (v) => String(Math.round(v * 100)), parse: (s) => Number(s) / 100, unit: '%' }} />
+              <Slider min={0} max={2} step={0.01} value={clip.volume} onChange={(v) => updateMediaClipProps(clip.id, { volume: v })} valueBox={{ format: (v) => String(Math.round(v * 100)), parse: (s) => Number(s) / 100, unit: '%' }} />
             </div>
             <div className="field-row prop-row">
               <label>Mute</label>

@@ -104,6 +104,11 @@ function fillBox(ctx: CanvasRenderingContext2D, box: TextBox, x: number, y: numb
   ctx.fill()
 }
 
+/** Where each text clip's block was last laid out (canvas px, before the page entrance
+ *  animation), keyed by clip id, with the timeline time it was drawn at. The preview reads it to
+ *  hit-test and outline the selected text without re-running the layout. */
+export const textBlockBounds = new Map<string, { x: number; y: number; w: number; h: number; t: number }>()
+
 /** Draws one text clip at timeline time `t`. Returns false if nothing was visible. */
 export function drawTextClip(ctx: CanvasRenderingContext2D, clip: TextClip, t: number, width: number, height: number): boolean {
   if (t < clip.start || t >= clip.start + clip.duration) return false
@@ -159,6 +164,7 @@ export function drawTextClip(ctx: CanvasRenderingContext2D, clip: TextClip, t: n
   const blockH = lineHeights.reduce((a, b) => a + b, 0)
   const x0 = (width - blockW) * tf.x
   const y0 = (height - blockH) * tf.y
+  textBlockBounds.set(clip.id, { x: x0, y: y0, w: blockW, h: blockH, t })
   let y = y0
   for (let i = 0; i < lines.length; i++) {
     let x = x0 + (blockW - lineWidths[i]) / 2

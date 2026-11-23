@@ -461,6 +461,11 @@ export interface SourceOverride {
 
 export interface MediaClip extends ClipBase {
   kind: 'media'
+  /** Fade in / out lengths in timeline seconds (the timeline's corner handles, like CapCut).
+   *  Video and images fade from/to black on the main track and from/to transparent on overlay
+   *  tracks; sound fades with them. */
+  fadeIn?: number
+  fadeOut?: number
   assetId: string
   trimIn: number // seconds into the source media
   trimOut: number // seconds into the source media
@@ -817,6 +822,17 @@ export function effectiveDuration(clip: MediaClip): number {
  *  segment-splitting in ffmpegGraph.ts. */
 /** The source playback rate at timeline-local time `localT`: the speed of the (piecewise-constant)
  *  speed segment playing then, or clip.speed without a curve. Direction (reversed) is not included. */
+/** The clip's fade multiplier (0..1) at clip-local time `localT`: a linear ramp over fadeIn /
+ *  fadeOut, the same curve export's `fade` / `afade` filters draw. */
+export function clipFadeGain(clip: Pick<MediaClip, 'duration' | 'fadeIn' | 'fadeOut'>, localT: number): number {
+  let g = 1
+  const fi = Math.min(clip.fadeIn ?? 0, clip.duration)
+  const fo = Math.min(clip.fadeOut ?? 0, clip.duration)
+  if (fi > 0 && localT < fi) g *= Math.max(0, localT / fi)
+  if (fo > 0 && localT > clip.duration - fo) g *= Math.max(0, (clip.duration - localT) / fo)
+  return g
+}
+
 export function clipSpeedAt(clip: MediaClip, localT: number): number {
   const segments = clipSpeedSegments(clip)
   if (segments.length === 1) return segments[0].speed
