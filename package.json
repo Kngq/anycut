@@ -1,7 +1,7 @@
 {
   "name": "anycut",
   "productName": "anycut",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A free, open-source desktop video editor inspired by CapCut.",
   "license": "MIT",
   "repository": {
@@ -22,7 +22,7 @@
     "test:export:keyframes": "tsx scripts/testExportKeyframes.ts",
     "test:export:effects": "tsx scripts/testExportEffects.ts",
     "test": "vitest run",
-    "dist": "npm run build && electron-builder --publish never"
+    "dist": "npm run build && node scripts/fetchFfmpeg.mjs && electron-builder --publish never"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.7.6",

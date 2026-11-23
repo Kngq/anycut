@@ -4,7 +4,7 @@ anycut's own source code is MIT-licensed (see [LICENSE](LICENSE)). The installer
 
 | Component | Used for | License |
 | --- | --- | --- |
-| [FFmpeg](https://ffmpeg.org) (via [ffmpeg-static](https://github.com/eugeneware/ffmpeg-static) and [ffprobe-static](https://github.com/joshwnj/ffprobe-static)) | Decoding, export, proxies, thumbnails | GPL (the bundled builds include GPL components such as x264/x265). FFmpeg runs as a separate program; its source is available at [ffmpeg.org/download.html](https://ffmpeg.org/download.html). |
+| [FFmpeg](https://ffmpeg.org) | Decoding, export, proxies, thumbnails | GPL. FFmpeg runs as a separate program. macOS builds ship the static GPLv3 build by [Martin Riedl](https://ffmpeg.martin-riedl.de) (build scripts: [gitlab.com/martinr92/ffmpeg](https://gitlab.com/martinr92/ffmpeg)); Windows and Linux ship the builds bundled by [ffmpeg-static](https://github.com/eugeneware/ffmpeg-static); ffprobe comes from [ffprobe-static](https://github.com/joshwnj/ffprobe-static). FFmpeg's source is available at [ffmpeg.org/download.html](https://ffmpeg.org/download.html). Release builds check that the bundled ffmpeg has no nonfree parts (`scripts/fetchFfmpeg.mjs`). |
 | [Electron](https://www.electronjs.org) (includes Chromium and Node.js) | Application runtime | MIT (Chromium and Node.js carry their own notices, shipped as `LICENSES.chromium.html` inside the app) |
 | [React](https://react.dev), [zustand](https://github.com/pmndrs/zustand) | User interface | MIT |
 | [ONNX Runtime](https://onnxruntime.ai) | Background removal and captions (Windows/Linux, and captions on all platforms) | MIT |

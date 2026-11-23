@@ -45,6 +45,8 @@ jobs:
           npm_config_onnxruntime_node_install_cuda: skip
       - run: npm test
       - run: npm run build
+      # macOS: swap in a redistributable (GPLv3) ffmpeg; every OS: refuse a nonfree one.
+      - run: node scripts/fetchFfmpeg.mjs
       - run: npx electron-builder ${{ matrix.args }} --publish never
       - uses: actions/upload-artifact@v4
         with:
