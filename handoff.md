@@ -724,3 +724,39 @@ Measured in the app (1080p, GOP 250): reversed 43% → 0% black frames, curve 7%
   - A local arm64 DMG builds (204 MB).
   - The packaged app was launched with `ANYCUT_SHOW_INACTIVE=1` (shows the window inactive, for agent smoke tests) over CDP. Probe, export (reverse + filter) and the background-removal runtime all work.
   - Captions were not exercised in the packaged build.
+
+## Floating overlay tracks, frame stepping, timeline scrub (2026-11-22)
+
+- **Floating overlays:** only the main (first) video track is the magnetic roll. `isMainVideoTrack()` is in projectStore.
+  - `repackVideoTrack(project, track)` now keeps overlay-track clips at their own `start`: it sorts them by start, re-derives durations and clears `transitionIn`.
+  - Add, move (`moveFreeClip` now accepts overlay video tracks, and main → overlay), trim-start, paste and freeze frame all honour that.
+  - Bin drops onto an overlay land at the pointer, snapped (`snapFreeStart` in shared/mediaDrop.ts). Timeline clip drags on any free track snap the same way, with a snap line; ⌘/Ctrl disables snapping.
+  - Export already composited overlays at `clip.start`.
+- **Arrow keys:** ← / → step one frame (⇧ = 1 s), snapped to the frame grid; stepping pauses playback.
+- **Following the playhead:** the timeline pages to keep the playhead visible while it plays or steps.
+- **Label column:** track labels and the new `.ruler-corner` sit at z-index 12, and `.track-lane` is its own stacking context. Clips, ghosts and the playhead now pass under the label column.
+- **Scrubbing:** the playhead handle is draggable (18×24 hit area). Dragging it, or the ruler, into 40 px of a lane edge auto-scrolls the timeline (up to 28 px/frame). The playhead stops at the end of the timeline content.
+
+## Faster background removal on macOS (2026-11-22)
+
+- **What changed:** on macOS, background removal runs on Apple's Vision framework (Neural Engine) instead of the ONNX models, through a small native helper.
+  - Helper source: `native/matte/main.swift`. It is built to `native-bin/anycut-matte` by `scripts/buildNative.mjs`, which runs in `npm run dev` / `npm run build`.
+  - It ships through electron-builder `mac.extraResources`.
+- **Pipeline:** decoder ffmpeg (BGRA, long side 1280) → helper → JS (`smoothMatte`, progress) → encoder ffmpeg, which is unchanged.
+- **Which Vision request each model uses:**
+  - People: `VNGeneratePersonSegmentationRequest` at `.accurate`, through `VNSequenceRequestHandler` for temporal consistency (macOS 12+).
+  - Any subject: `VNGenerateForegroundInstanceMaskRequest` (macOS 14+; older systems fall back to ISNet).
+- **No downloads:** no model download is needed on the Mac; `backgroundStatus` reports both models ready.
+- **Cache keys:** Vision bakes get a `-vision` cache-key suffix.
+- **Fallback:** Windows / Linux, or a missing helper, use the ONNX path as before.
+- **Measured on a 12 s 1080p clip (M5), whole bake including encoding:**
+  - People: 33.5 s (MODNet) → 17.3 s.
+  - Any subject: ~5 min (ISNet, ~870 ms/frame) → 7.6 s.
+  - Packaged app verified.
+- **Tried and rejected:**
+  - CoreML / WebGPU execution providers for MODNet: CoreML only takes 117 of 242 nodes, so no gain; WebGPU is 2× slower.
+  - Int8 / fp16 MODNet: ≤18% faster.
+  - Parallel ORT sessions: no gain.
+  - Smaller Vision input: no gain.
+  - Two Vision helpers in parallel: 25% faster, not worth the frame-split complexity.
+- **Mask quality:** not yet compared against MODNet on real footage of people (no non-personal test clip with a person available).

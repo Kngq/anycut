@@ -1,6 +1,7 @@
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import fs from 'node:fs/promises'
-import { createWriteStream } from 'node:fs'
+import fsSync, { createWriteStream } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { app, net } from 'electron'
 import { ffmpegPath } from './binaries'
@@ -78,6 +79,29 @@ export const MATTING_MODELS: Record<MattingModelId, MattingModel> = {
   }
 }
 
+/**
+ * macOS: Apple's Vision framework does both cutouts on the Neural Engine via the bundled
+ * `anycut-matte` helper (native/matte/main.swift): ~3× faster than MODNet for people and ~40×
+ * faster than ISNet for any subject on Apple Silicon, with full-resolution masks and no model
+ * download. Elsewhere, or if the helper is missing, the ONNX models below run instead.
+ */
+const VISION_MODE: Record<MattingModelId, 'person' | 'subject'> = { person: 'person', general: 'subject' }
+/** Frame size fed to Vision (long side). Its masks come back at about this size and are scaled to
+ *  the source by the encoder. */
+const VISION_INPUT_SIZE = 1280
+
+function visionHelperPath(): string | null {
+  if (process.platform !== 'darwin') return null
+  const p = app.isPackaged ? path.join(process.resourcesPath, 'anycut-matte') : path.join(app.getAppPath(), 'native-bin', 'anycut-matte')
+  return fsSync.existsSync(p) ? p : null
+}
+
+/** "Any subject" needs macOS 14 (Sonoma); Darwin 23 = macOS 14. */
+function visionSupports(id: MattingModelId): boolean {
+  if (!visionHelperPath()) return false
+  return id === 'person' || Number(os.release().split('.')[0]) >= 23
+}
+
 function modelsDir(): string {
   return path.join(app.getPath('userData'), 'models')
 }
@@ -133,16 +157,21 @@ async function loadOnnx(): Promise<OrtModule | null> {
 export async function backgroundStatus(): Promise<BackgroundStatus> {
   const onnx = await loadOnnx()
   const models = await Promise.all(
-    Object.values(MATTING_MODELS).map(async (m) => ({
-      id: m.id,
-      label: m.label,
-      description: m.description,
-      sizeMB: m.sizeMB,
-      downloaded: await fileExists(modelPath(m.id))
-    }))
+    Object.values(MATTING_MODELS).map(async (m) =>
+      visionSupports(m.id)
+        ? {
+            id: m.id,
+            label: m.label,
+            description: m.id === 'person' ? 'Best for people. Runs on your Mac\'s Neural Engine.' : 'Objects, pets, products. Runs on your Mac\'s Neural Engine.',
+            sizeMB: 0,
+            downloaded: true
+          }
+        : { id: m.id, label: m.label, description: m.description, sizeMB: m.sizeMB, downloaded: await fileExists(modelPath(m.id)) }
+    )
   )
+  const anyVision = models.some((m) => visionSupports(m.id))
   return {
-    runtimeAvailable: onnx !== null,
+    runtimeAvailable: onnx !== null || anyVision,
     models,
     installHint: onnx === null ? 'Install the local ML runtime to enable background removal: `npm i onnxruntime-node`.' : undefined
   }
@@ -248,9 +277,12 @@ export async function removeBackground(
 ): Promise<BackgroundResult> {
   const model = MATTING_MODELS[modelId]
   if (!model) return { ok: false, error: `unknown model "${modelId}"` }
-  const onnx = await loadOnnx()
-  if (!onnx) return { ok: false, error: 'Local ML runtime (onnxruntime-node) is not installed.' }
-  if (!(await fileExists(modelPath(modelId)))) return { ok: false, error: `The ${model.label} model isn't downloaded yet.` }
+  const vision = visionSupports(modelId) ? visionHelperPath() : null
+  const onnx = vision ? null : await loadOnnx()
+  if (!vision) {
+    if (!onnx) return { ok: false, error: 'Local ML runtime (onnxruntime-node) is not installed.' }
+    if (!(await fileExists(modelPath(modelId)))) return { ok: false, error: `The ${model.label} model isn't downloaded yet.` }
+  }
 
   // The bake is content-keyed like every other derived artifact: re-running on an unchanged source
   // returns the cached file instantly, and the output survives restarts (it's referenced by the
@@ -258,15 +290,16 @@ export async function removeBackground(
   const src = await stampSource(inputPath)
   if (!src) return { ok: false, error: 'source file is missing' }
   // Model is part of the key: the same clip can be baked with either model.
-  const key = `${cacheKey('mattes', src)}-${modelId}`
+  const key = `${cacheKey('mattes', src)}-${modelId}${vision ? '-vision' : ''}`
   const outPath = await entryPath('mattes', key, '.mov')
   const previewOut = await entryPath('mattes', key, '.webm')
   if ((await fileExists(outPath)) && (await fileExists(previewOut))) return { ok: true, outputPath: outPath, previewPath: previewOut }
 
   const { fps, width, height, durationSec } = await sourceInfo(inputPath)
-  const dims = inputDims(model, width, height)
+  const dims = vision ? visionDims(width, height) : inputDims(model, width, height)
   const pixels = dims.w * dims.h
-  const frameBytes = pixels * 3
+  // Vision takes BGRA frames, the ONNX path planar-ready RGB.
+  const frameBytes = pixels * (vision ? 4 : 3)
   const expectedFrames = Math.max(1, Math.round(durationSec * (parseFps(fps) || 30)))
   // Frame index → seconds at the source rate, applied to both the source and the matte stream.
   const retime = `setpts=N/(${fps})/TB`
@@ -282,10 +315,11 @@ export async function removeBackground(
 
   let decoder: ReturnType<typeof startFfmpeg> | null = null
   let encoder: ReturnType<typeof startFfmpeg> | null = null
+  let helper = null as ChildProcessWithoutNullStreams | null
   try {
-    const session = await onnx.InferenceSession.create(modelPath(modelId))
+    const session = onnx ? await onnx.InferenceSession.create(modelPath(modelId)) : null
 
-    decoder = startFfmpeg(['-i', inputPath, '-map', '0:v:0', '-vf', `scale=${dims.w}:${dims.h}`, '-fps_mode', 'passthrough', '-pix_fmt', 'rgb24', '-f', 'rawvideo', 'pipe:1'])
+    decoder = startFfmpeg(['-i', inputPath, '-map', '0:v:0', '-vf', `scale=${dims.w}:${dims.h}`, '-fps_mode', 'passthrough', '-pix_fmt', vision ? 'bgra' : 'rgb24', '-f', 'rawvideo', 'pipe:1'])
     encoder = startFfmpeg(
       [
         '-y',
@@ -360,26 +394,54 @@ export async function removeBackground(
     let pending: Buffer = Buffer.alloc(0)
     let frames = 0
 
-    const processFrame = async (rgb: Uint8Array) => {
-      rgbToNchw(rgb, pixels, model.mean, model.std, input)
-      const tensor = new onnx.Tensor('float32', input, [1, 3, dims.h, dims.w])
-      const results = await session.run({ [session.inputNames[0]]: tensor })
-      const gray = smoothMatte(matteToGray(results[session.outputNames[0]].data, model.output), prevGray)
+    const emitMatte = async (raw: Uint8Array) => {
+      const gray = smoothMatte(raw, prevGray)
       prevGray = gray
       await writeChunk(encIn, gray)
       frames++
       onProgress?.(Math.min(0.99, frames / expectedFrames))
     }
+    const processFrame = async (rgb: Uint8Array) => {
+      rgbToNchw(rgb, pixels, model.mean, model.std, input)
+      const tensor = new onnx!.Tensor('float32', input, [1, 3, dims.h, dims.w])
+      const results = await session!.run({ [session!.inputNames[0]]: tensor })
+      await emitMatte(matteToGray(results[session!.outputNames[0]].data, model.output))
+    }
 
     try {
-      for await (const chunk of decoder.proc.stdout! as AsyncIterable<Buffer>) {
-        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk
-        let off = 0
-        while (pending.length - off >= frameBytes) {
-          await processFrame(pending.subarray(off, off + frameBytes))
-          off += frameBytes
+      if (vision) {
+        // decoder → helper (Vision) → here (temporal smoothing, progress) → encoder.
+        const h = spawn(vision, [VISION_MODE[modelId], String(dims.w), String(dims.h)])
+        helper = h
+        let helperErr = ''
+        h.stderr.on('data', (c) => (helperErr = (helperErr + c).slice(-500)))
+        const helperDone = new Promise<void>((resolve, reject) => {
+          h.on('error', reject)
+          h.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`background removal helper exited ${code}: ${helperErr.trim()}`))))
+        })
+        helperDone.catch(() => {})
+        decoder.proc.stdout!.pipe(h.stdin)
+        h.stdin.on('error', () => {}) // surfaces through helperDone
+        for await (const chunk of h.stdout as AsyncIterable<Buffer>) {
+          pending = pending.length ? Buffer.concat([pending, chunk]) : chunk
+          let off = 0
+          while (pending.length - off >= pixels) {
+            await emitMatte(new Uint8Array(pending.subarray(off, off + pixels)))
+            off += pixels
+          }
+          pending = off ? pending.subarray(off) : pending
         }
-        pending = off ? pending.subarray(off) : pending
+        await helperDone
+      } else {
+        for await (const chunk of decoder.proc.stdout! as AsyncIterable<Buffer>) {
+          pending = pending.length ? Buffer.concat([pending, chunk]) : chunk
+          let off = 0
+          while (pending.length - off >= frameBytes) {
+            await processFrame(pending.subarray(off, off + frameBytes))
+            off += frameBytes
+          }
+          pending = off ? pending.subarray(off) : pending
+        }
       }
       await decoder.done
       if (frames === 0) throw new Error('no frames decoded')
@@ -398,10 +460,19 @@ export async function removeBackground(
   } catch (err) {
     decoder?.proc.kill('SIGKILL')
     encoder?.proc.kill('SIGKILL')
+    helper?.kill('SIGKILL')
     await fs.unlink(tmpMov).catch(() => {})
     await fs.unlink(tmpWebm).catch(() => {})
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
+}
+
+/** Vision input size: the frame's aspect, long side VISION_INPUT_SIZE (never upscaled), even sides. */
+function visionDims(frameW: number, frameH: number): { w: number; h: number } {
+  if (!frameW || !frameH) return { w: VISION_INPUT_SIZE, h: VISION_INPUT_SIZE }
+  const k = Math.min(1, VISION_INPUT_SIZE / Math.max(frameW, frameH))
+  const even = (v: number) => Math.max(2, Math.round((v * k) / 2) * 2)
+  return { w: even(frameW), h: even(frameH) }
 }
 
 /** Source frame rate as an ffmpeg rational (e.g. "30000/1001"), so the bake keeps exactly the

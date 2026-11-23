@@ -12,8 +12,8 @@
   "type": "module",
   "main": "dist-electron/main/index.js",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "dev": "node scripts/buildNative.mjs && vite",
+    "build": "tsc -p tsconfig.json --noEmit && vite build && node scripts/buildNative.mjs",
     "preview": "vite preview",
     "test:export": "tsx scripts/testExport.ts",
     "test:export:speed": "tsx scripts/testExportSpeed.ts",
@@ -81,7 +81,13 @@
         "dmg"
       ],
       "identity": "-",
-      "hardenedRuntime": false
+      "hardenedRuntime": false,
+      "extraResources": [
+        {
+          "from": "native-bin/anycut-matte",
+          "to": "anycut-matte"
+        }
+      ]
     },
     "dmg": {
       "artifactName": "anycut-mac-${arch}.${ext}"

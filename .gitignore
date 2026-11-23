@@ -8,3 +8,4 @@ dist-electron/
 # Reference-only CapCut user data copied in for format research — not app code.
 capcutcopy/
 release/
+native-bin/
