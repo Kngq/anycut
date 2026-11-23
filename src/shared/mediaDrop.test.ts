@@ -88,3 +88,23 @@ describe('resolveMediaDrop', () => {
     expect(resolveMediaDrop(p, audio, opts(p, 'audio', 30.02, { playhead: 30, snap: false }))!.start).toBeCloseTo(30.02)
   })
 })
+
+describe('resolveMediaDrop on an overlay video track', () => {
+  function withOverlay(): { p: Project; overlayId: string } {
+    const p = project()
+    const overlay = { id: 'ov', type: 'video' as const, name: 'Video 2', clips: [media('o1', 'ov', 20, 2)], muted: false, hidden: false }
+    p.tracks = [...p.tracks, overlay]
+    return { p, overlayId: overlay.id }
+  }
+
+  it('floats: lands where it is dropped instead of at the start', () => {
+    const { p, overlayId } = withOverlay()
+    expect(resolveMediaDrop(p, video, { ...opts(p, 'video', 13), trackId: overlayId })).toMatchObject({ trackId: overlayId, start: 13, snapTime: null })
+  })
+
+  it('snaps to clip edges on other tracks', () => {
+    const { p, overlayId } = withOverlay()
+    // 7.95s → the main track's 8s cut (5px away at 100px/s).
+    expect(resolveMediaDrop(p, video, { ...opts(p, 'video', 7.95), trackId: overlayId })).toMatchObject({ start: 8, snapTime: 8, snapKind: 'edge' })
+  })
+})

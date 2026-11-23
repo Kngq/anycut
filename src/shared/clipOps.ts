@@ -141,7 +141,8 @@ export function pasteClips(project: Project, board: ClipClipboard, playhead: num
   const next = mapTracks(project, (t) => {
     const add = byTrack.get(t.id)
     if (!add) return t
-    if (t.type !== 'video') return { ...t, clips: [...t.clips, ...add] }
+    // Only the main video roll inserts by position; overlay tracks float (repack sorts by start).
+    if (t.type !== 'video' || t.id !== project.tracks.find((x) => x.type === 'video')?.id) return repack({ ...t, clips: [...t.clips, ...add] })
     // Insert at the clip boundary nearest the playhead.
     let index = t.clips.length
     for (let i = 0; i < t.clips.length; i++) {

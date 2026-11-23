@@ -44,8 +44,8 @@ export function resolveMediaDrop(
   if (!track) return null
   const duration = dropDurationFor(asset)
 
-  if (track.type === 'video') {
-    // Video tracks stay gap-free (CapCut's main-track magnet). The drop inserts before the first
+  if (track.type === 'video' && project.tracks.find((t) => t.type === 'video')?.id === track.id) {
+    // The main video track stays gap-free (CapCut's main-track magnet). The drop inserts before the first
     // clip whose midpoint is past the pointer, which is the same rule addMediaClipToTrack uses.
     // So the ghost sits exactly at that cut.
     const clips = [...track.clips].sort((a, b) => a.start - b.start)
@@ -55,13 +55,27 @@ export function resolveMediaDrop(
     return { trackId: track.id, start, duration, snapTime: clips.length > 0 ? start : null, snapKind: clips.length > 0 ? 'edge' : null }
   }
 
-  // Free tracks: the clip goes where the pointer is, with its start OR end edge snapped to the
-  // nearest target (clip edges on any track, the playhead, 0).
-  let start = Math.max(0, at.time)
-  if (!at.snap) return { trackId: track.id, start, duration, snapTime: null, snapKind: null }
+  // Free tracks (overlay video, audio, text): the clip goes where the pointer is, with its start
+  // OR end edge snapped to the nearest target (clip edges on any track, the playhead, 0).
+  if (!at.snap) return { trackId: track.id, start: Math.max(0, at.time), duration, snapTime: null, snapKind: null }
+  return { trackId: track.id, duration, ...snapFreeStart(project, at.time, duration, at.pxPerSecond, at.playhead) }
+}
 
-  const targets: { t: number; kind: 'playhead' | 'edge' }[] = [{ t: 0, kind: 'edge' }, { t: at.playhead, kind: 'playhead' }]
-  for (const t of project.tracks) for (const c of t.clips) targets.push({ t: c.start, kind: 'edge' }, { t: c.start + c.duration, kind: 'edge' })
+/** Snaps a free-track clip spanning [start, start+duration) so its start or end edge lands on the
+ *  nearest clip edge (any track, except `ignoreClipId`), the playhead or 0, within MEDIA_SNAP_PX.
+ *  Shared by bin drops and dragging an existing clip along a free track. */
+export function snapFreeStart(
+  project: Project,
+  time: number,
+  duration: number,
+  pxPerSecond: number,
+  playhead: number,
+  ignoreClipId?: string
+): { start: number; snapTime: number | null; snapKind: 'playhead' | 'edge' | null } {
+  let start = Math.max(0, time)
+  const targets: { t: number; kind: 'playhead' | 'edge' }[] = [{ t: 0, kind: 'edge' }, { t: playhead, kind: 'playhead' }]
+  for (const t of project.tracks) for (const c of t.clips) if (c.id !== ignoreClipId) targets.push({ t: c.start, kind: 'edge' }, { t: c.start + c.duration, kind: 'edge' })
+  const at = { pxPerSecond }
 
   const radius = MEDIA_SNAP_PX / Math.max(at.pxPerSecond, 1e-6)
   let best: { delta: number; t: number; kind: 'playhead' | 'edge' } | null = null
@@ -73,7 +87,7 @@ export function resolveMediaDrop(
   }
   if (best && start + best.delta >= 0) {
     start += best.delta
-    return { trackId: track.id, start, duration, snapTime: best.t, snapKind: best.kind }
+    return { start, snapTime: best.t, snapKind: best.kind }
   }
-  return { trackId: track.id, start, duration, snapTime: null, snapKind: null }
+  return { start, snapTime: null, snapKind: null }
 }

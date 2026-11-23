@@ -251,16 +251,30 @@ function clipTimelineDuration(c: Clip): number {
   return c.kind === 'media' ? effectiveDuration(c) : c.duration
 }
 
+/** The main video track (the first one) is the magnetic roll; every other video track is a
+ *  free-floating overlay track. */
+export function isMainVideoTrack(project: Project, trackId: string): boolean {
+  return project.tracks.find((t) => t.type === 'video')?.id === trackId
+}
+
 /**
- * Video tracks are a contiguous roll: array order === playback order, and `start` is a
- * derived value, not something a drag can set freely. A transitionIn pulls a clip's start
+ * Only the MAIN video track is a contiguous roll: array order === playback order, and `start` is a
+ * derived value, not something a drag can set freely. Overlay video tracks float like audio/text:
+ * each clip keeps its own `start` (export composites them at that time), clips are kept sorted by
+ * start, and they carry no transitions (export doesn't model transitions off the main track). A transitionIn pulls a clip's start
  * back by its (clamped) duration, exactly mirroring the xfade offset math in ffmpegGraph.ts
  * so the canvas preview and the exported file always agree. `duration` is also re-derived
  * here for media clips (speed/curve/frozen can change it) and cached onto the clip so other
  * code (Timeline width, projectDuration) can keep reading `clip.duration` directly.
  */
-function repackVideoTrack(track: Track): Track {
+function repackVideoTrack(project: Project, track: Track): Track {
   if (track.type !== 'video') return track
+  if (!isMainVideoTrack(project, track.id)) {
+    const floating = track.clips
+      .map((c) => ({ ...c, start: Math.max(0, c.start), duration: clipTimelineDuration(c), transitionIn: undefined }) as Clip)
+      .sort((a, b) => a.start - b.start)
+    return { ...track, clips: floating }
+  }
   const clips = track.clips
   let cursor = 0
   const repacked = clips.map((c, i) => {
@@ -396,7 +410,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     set((s) => {
       const tracks = s.project.tracks.map((t) => {
         const clips = t.clips.filter((c) => !(c.kind === 'media' && c.assetId === assetId))
-        return t.type === 'video' ? repackVideoTrack({ ...t, clips }) : { ...t, clips }
+        return t.type === 'video' ? repackVideoTrack(s.project, { ...t, clips }) : { ...t, clips }
       })
       const assets = s.project.assets.filter((a) => a.id !== assetId)
       const project = touch({ ...s.project, tracks, assets })
@@ -444,7 +458,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         id: uuid(),
         kind: 'media',
         trackId,
-        start: track.type === 'video' ? 0 : start,
+        start: isMainVideoTrack(s.project, trackId) ? 0 : Math.max(0, start),
         duration,
         trimIn: 0,
         trimOut: asset.kind === 'image' ? duration : asset.duration,
@@ -458,12 +472,12 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       }
       const project = updateTrack(s.project, trackId, (t) => {
         let clips = [...t.clips, clip]
-        if (t.type === 'video' && options?.insertAtStart) {
+        if (isMainVideoTrack(s.project, t.id) && options?.insertAtStart) {
           // Insert before the first clip whose midpoint is after the drop point, like a drag-reorder.
           const index = t.clips.findIndex((c) => start < c.start + c.duration / 2)
           if (index !== -1) clips = [...t.clips.slice(0, index), clip, ...t.clips.slice(index)]
         }
-        return repackVideoTrack({ ...t, clips })
+        return repackVideoTrack(s.project, { ...t, clips })
       })
       // When the timeline becomes "long" (>= LONG_TIMELINE_SECONDS), snap to minimum zoom so the
       // whole thing fits. Setting pxPerSecond to 1 lands below the Timeline's dynamic floor; the
@@ -609,19 +623,21 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   moveFreeClip: (clipId, newStart, newTrackId) =>
     set((s) => {
       const found = findClip(s.project, clipId)
-      if (!found || found.track.type === 'video') return {}
+      if (!found) return {}
       const targetTrackId = newTrackId ?? found.track.id
       const targetTrack = s.project.tracks.find((t) => t.id === targetTrackId)
-      if (!targetTrack || targetTrack.type === 'video') return {}
+      // The main video roll is positioned by order, not time: moves onto it go through
+      // reorderVideoClip. Clips keep to their kind of track.
+      if (!targetTrack || isMainVideoTrack(s.project, targetTrackId) || targetTrack.type !== found.track.type) return {}
       const clampedStart = Math.max(0, newStart)
       const tracks = s.project.tracks.map((t) => {
         if (t.id === found.track.id && t.id !== targetTrackId) {
-          return { ...t, clips: t.clips.filter((c) => c.id !== clipId) }
+          return repackVideoTrack(s.project, { ...t, clips: t.clips.filter((c) => c.id !== clipId) })
         }
         if (t.id === targetTrackId) {
           const withoutClip = t.clips.filter((c) => c.id !== clipId)
           const moved = { ...found.clip, start: clampedStart, trackId: targetTrackId }
-          return { ...t, clips: [...withoutClip, moved] }
+          return repackVideoTrack(s.project, { ...t, clips: [...withoutClip, moved] })
         }
         return t
       })
@@ -637,14 +653,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
       const tracks = s.project.tracks.map((t) => {
         if (t.id === found.track.id && t.id !== toTrackId) {
-          return repackVideoTrack({ ...t, clips: t.clips.filter((c) => c.id !== clipId) })
+          return repackVideoTrack(s.project, { ...t, clips: t.clips.filter((c) => c.id !== clipId) })
         }
         if (t.id === toTrackId) {
           const without = t.clips.filter((c) => c.id !== clipId)
           const clampedIndex = Math.max(0, Math.min(toIndex, without.length))
           const moved = { ...found.clip, trackId: toTrackId }
           const next = [...without.slice(0, clampedIndex), moved, ...without.slice(clampedIndex)]
-          return repackVideoTrack({ ...t, clips: next })
+          return repackVideoTrack(s.project, { ...t, clips: next })
         }
         return t
       })
@@ -663,10 +679,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         const newDuration = edge === 'start' ? clip.start + clip.duration - newTime : newTime - clip.start
         if (newDuration < 0.1) return {}
         const patch: Partial<Clip> = { duration: newDuration }
-        if (edge === 'start' && found.track.type !== 'video') patch.start = newTime
+        if (edge === 'start' && !isMainVideoTrack(s.project, found.track.id)) patch.start = newTime
         const project = updateTrack(s.project, found.track.id, (t) => {
           const withPatch = { ...t, clips: t.clips.map((c) => (c.id === clipId ? ({ ...c, ...patch } as Clip) : c)) }
-          return repackVideoTrack(withPatch)
+          return repackVideoTrack(s.project, withPatch)
         })
         return { project, dirty: true }
       }
@@ -688,7 +704,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         const newDuration = clip.duration - delta
         if (newDuration < 0.1) return {}
         patch = { duration: newDuration }
-        if (found.track.type !== 'video') patch.start = clip.start + delta
+        if (!isMainVideoTrack(s.project, found.track.id)) patch.start = clip.start + delta
         if (clip.kind === 'media') patch = { ...patch, trimIn: clip.trimIn + delta * speed } as Partial<MediaClip>
       } else {
         let newDuration = newTime - clip.start
@@ -701,7 +717,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       }
       const project = updateTrack(s.project, found.track.id, (t) => {
         const withPatch = { ...t, clips: t.clips.map((c) => (c.id === clipId ? ({ ...c, ...patch } as Clip) : c)) }
-        return repackVideoTrack(withPatch)
+        return repackVideoTrack(s.project, withPatch)
       })
       return { project, dirty: true }
     }),
@@ -738,7 +754,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         const clips = [...tr.clips]
         clips[index] = first
         clips.splice(index + 1, 0, second)
-        return repackVideoTrack({ ...tr, clips })
+        return repackVideoTrack(s.project, { ...tr, clips })
       })
       return { project, dirty: true, selectedClipId: second.id, ...recordPast(s) }
     }),
@@ -772,10 +788,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       }
 
       const project = updateTrack(s.project, track.id, (tr) => {
-        const clips = [...tr.clips]
+        // On a floating overlay track nothing re-derives starts: push the second half and every
+        // later clip right by the freeze's length (the main roll's repack does this by itself).
+        const floating = !isMainVideoTrack(s.project, tr.id)
+        const end = clip.start + clip.duration
+        const clips = tr.clips.map((c) => (floating && c.start >= end - 1e-6 ? ({ ...c, start: c.start + freeze.duration } as Clip) : c))
         clips[index] = first
-        clips.splice(index + 1, 0, freeze, second)
-        return repackVideoTrack({ ...tr, clips })
+        clips.splice(index + 1, 0, freeze, floating ? { ...second, start: t + freeze.duration } : second)
+        return repackVideoTrack(s.project, { ...tr, clips })
       })
       return { project, dirty: true, selectedClipId: freeze.id, ...recordPast(s) }
     }),
@@ -790,7 +810,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       const project = updateTrack(s.project, track.id, (t) => {
         const clips = [...t.clips]
         clips.splice(index, 2, merged)
-        return repackVideoTrack({ ...t, clips })
+        return repackVideoTrack(s.project, { ...t, clips })
       })
       return { project, dirty: true, selectedClipId: merged.id, ...recordPast(s) }
     }),
@@ -799,7 +819,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     set((s) => {
       const found = findClip(s.project, clipId)
       if (!found) return {}
-      const project = updateTrack(s.project, found.track.id, (t) => repackVideoTrack({ ...t, clips: t.clips.filter((c) => c.id !== clipId) }))
+      const project = updateTrack(s.project, found.track.id, (t) => repackVideoTrack(s.project, { ...t, clips: t.clips.filter((c) => c.id !== clipId) }))
       return { project, dirty: true, selectedClipId: s.selectedClipId === clipId ? null : s.selectedClipId, ...recordPast(s) }
     }),
 
@@ -817,7 +837,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
             c.id === clipId ? { ...c, transitionIn: duration > 0 ? { type: c.transitionIn?.type ?? ('crossfade' as const), duration } : undefined } : c
           )
         }
-        return repackVideoTrack(withPatch)
+        return repackVideoTrack(s.project, withPatch)
       })
       return { project, dirty: true, ...recordPast(s) }
     }),
@@ -827,7 +847,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       if (!canHaveTransition(s.project, clipId)) return {}
       const found = findClip(s.project, clipId)!
       const project = updateTrack(s.project, found.track.id, (t) =>
-        repackVideoTrack({
+        repackVideoTrack(s.project, {
           ...t,
           clips: t.clips.map((c) => (c.id === clipId ? { ...c, transitionIn: transition && transition.duration > 0 ? transition : undefined } : c))
         })
@@ -846,7 +866,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
           ...t,
           clips: t.clips.map((c) => (c.id === clipId && c.transitionIn ? { ...c, transitionIn: { ...c.transitionIn, type } } : c))
         }
-        return repackVideoTrack(withPatch)
+        return repackVideoTrack(s.project, withPatch)
       })
       return { project, dirty: true, ...recordPast(s) }
     }),
@@ -903,7 +923,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       const clamped = Math.min(Math.max(speed, 0.1), 4)
       const project = updateTrack(s.project, found.track.id, (t) => {
         const withPatch = { ...t, clips: t.clips.map((c) => (c.id === clipId ? { ...c, speed: clamped } : c)) }
-        return repackVideoTrack(withPatch)
+        return repackVideoTrack(s.project, withPatch)
       })
       return { project, dirty: true }
     }),
@@ -923,7 +943,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         : { speedCurvePoints: undefined, speedCurvePreset: undefined, speedKeyframes: undefined }
       const project = updateTrack(s.project, found.track.id, (t) => {
         const withPatch = { ...t, clips: t.clips.map((c) => (c.id === clipId ? ({ ...c, ...patch } as Clip) : c)) }
-        return repackVideoTrack(withPatch)
+        return repackVideoTrack(s.project, withPatch)
       })
       return { project, dirty: true, ...(opts?.live ? {} : recordPast(s)) }
     }),
@@ -950,7 +970,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
           ...t,
           clips: t.clips.map((c) => (c.id === clipId ? { ...c, speedKeyframes: sanitized, speedCurvePoints: undefined, speedCurvePreset: undefined } : c))
         }
-        return repackVideoTrack(withPatch)
+        return repackVideoTrack(s.project, withPatch)
       })
       return { project, dirty: true }
     }),
@@ -961,7 +981,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       if (!found || found.clip.kind !== 'media') return {}
       const project = updateTrack(s.project, found.track.id, (t) => {
         const withPatch = { ...t, clips: t.clips.map((c) => (c.id === clipId ? { ...c, reversed } : c)) }
-        return repackVideoTrack(withPatch)
+        return repackVideoTrack(s.project, withPatch)
       })
       return { project, dirty: true }
     }),
@@ -979,7 +999,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         : transform
       const project = updateTrack(s.project, found.track.id, (t) => {
         const withPatch = { ...t, clips: t.clips.map((c) => (c.id === clipId ? { ...c, transform: sortedTransform } : c)) }
-        return repackVideoTrack(withPatch)
+        return repackVideoTrack(s.project, withPatch)
       })
       return { project, dirty: true }
     }),
@@ -998,7 +1018,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
             return { ...c, transform: { ...c.transform, rotation } }
           })
         }
-        return repackVideoTrack(withPatch)
+        return repackVideoTrack(s.project, withPatch)
       })
       return { project, dirty: true, ...recordPast(s) }
     }),
@@ -1012,7 +1032,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
           ...t,
           clips: t.clips.map((c) => (c.id === clipId ? { ...c, transform: { ...c.transform, flipH: !c.transform.flipH } } : c))
         }
-        return repackVideoTrack(withPatch)
+        return repackVideoTrack(s.project, withPatch)
       })
       return { project, dirty: true, ...recordPast(s) }
     }),
@@ -1103,7 +1123,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   paste: () =>
     set((s) => {
       if (!s.clipboard) return {}
-      const { project, ids } = ops.pasteClips(s.project, s.clipboard, s.playhead, uuid, repackVideoTrack)
+      const { project, ids } = ops.pasteClips(s.project, s.clipboard, s.playhead, uuid, (t: Track) => repackVideoTrack(s.project, t))
       if (ids.length === 0) return {}
       return { project, dirty: true, selectedClipId: ids[0], selectedClipIds: ids, ...recordPast(s) }
     }),
@@ -1118,14 +1138,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     set((s) => {
       const ids = selectionOf(s)
       if (!s.attributeClipboard || ids.length === 0) return {}
-      return { project: ops.pasteAttributes(s.project, ids, s.attributeClipboard, repackVideoTrack), dirty: true, ...recordPast(s) }
+      return { project: ops.pasteAttributes(s.project, ids, s.attributeClipboard, (t: Track) => repackVideoTrack(s.project, t)), dirty: true, ...recordPast(s) }
     }),
 
   deleteSelection: () =>
     set((s) => {
       const ids = selectionOf(s)
       if (ids.length === 0) return {}
-      return { project: ops.removeClips(s.project, ids, repackVideoTrack), dirty: true, selectedClipId: null, selectedClipIds: [], ...recordPast(s) }
+      return { project: ops.removeClips(s.project, ids, (t: Track) => repackVideoTrack(s.project, t)), dirty: true, selectedClipId: null, selectedClipIds: [], ...recordPast(s) }
     }),
 
   setSelectionDisabled: (disabled) =>
@@ -1159,7 +1179,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   replaceClipMedia: (clipId, asset) =>
     set((s) => {
       const withAsset = s.project.assets.some((a) => a.id === asset.id) ? s.project : { ...s.project, assets: [...s.project.assets, asset] }
-      const project = ops.replaceClipMedia(withAsset, clipId, asset, repackVideoTrack)
+      const project = ops.replaceClipMedia(withAsset, clipId, asset, (t: Track) => repackVideoTrack(s.project, t))
       return project ? { project: touch(project), dirty: true, ...recordPast(s) } : {}
     }),
 
@@ -1189,7 +1209,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   applyCompound: (clipIds, asset) =>
     set((s) => {
       const withAsset = { ...s.project, assets: [...s.project.assets, asset] }
-      const res = ops.replaceWithCompound(withAsset, clipIds, asset, uuid, repackVideoTrack)
+      const res = ops.replaceWithCompound(withAsset, clipIds, asset, uuid, (t: Track) => repackVideoTrack(s.project, t))
       if (!res) return {}
       return { project: touch(res.project), dirty: true, selectedClipId: res.clipId, selectedClipIds: [res.clipId], ...recordPast(s) }
     }),

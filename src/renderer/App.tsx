@@ -10,6 +10,7 @@ import Toasts from './components/Toasts'
 import CropDialog from './components/CropDialog'
 import { createCompoundClip } from './clipActions'
 import { selectionOf, useProjectStore } from './state/projectStore'
+import { projectDuration } from '@shared/types'
 
 const store = () => useProjectStore.getState()
 import { useLayoutStore } from './state/layoutStore'
@@ -71,6 +72,18 @@ export default function App() {
         // Cmd+M = mirror (horizontal flip) the selected clip.
         e.preventDefault()
         if (selectedClipId) toggleClipFlipH(selectedClipId)
+      } else if (!mod && !e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        // ← / → step the playhead one frame (⇧ = one second), landing on frame boundaries. Stepping
+        // pauses playback, as in CapCut.
+        e.preventDefault()
+        const s = store()
+        const fps = s.project.canvas.fps || 30
+        const dir = e.key === 'ArrowRight' ? 1 : -1
+        const frames = e.shiftKey ? fps : 1
+        const frame = Math.round(s.playhead * fps) + dir * frames
+        const end = projectDuration(s.project)
+        if (s.isPlaying) setIsPlaying(false)
+        s.setPlayhead(Math.min(Math.max(frame / fps, 0), Math.max(end, 0)))
       } else if (e.code === 'Space') {
         e.preventDefault()
         setIsPlaying(!isPlaying)
