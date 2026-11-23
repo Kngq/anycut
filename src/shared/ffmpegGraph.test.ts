@@ -233,3 +233,20 @@ describe('buildFfmpegPlan — transition audio crossfade', () => {
     expect(plan.filterComplex).not.toContain('afade')
   })
 })
+
+describe('buildFfmpegPlan — image inputs', () => {
+  function imageProject(path: string): Project {
+    const p = twoClipProject()
+    return { ...p, assets: [{ id: 'a1', path, kind: 'image', name: path, duration: 10, hasAudio: false }] }
+  }
+
+  it('loops still images with the image2 -loop option', () => {
+    const plan = buildFfmpegPlan(imageProject('/tmp/a.png'))
+    expect(plan.inputs).toEqual(['-loop', '1', '-framerate', '30', '-i', '/tmp/a.png'])
+  })
+
+  it('uses -stream_loop for GIFs (the gif demuxer has no -loop option)', () => {
+    const plan = buildFfmpegPlan(imageProject('/tmp/a.GIF'))
+    expect(plan.inputs).toEqual(['-stream_loop', '-1', '-i', '/tmp/a.GIF'])
+  })
+})

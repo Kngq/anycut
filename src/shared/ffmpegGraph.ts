@@ -180,7 +180,11 @@ export function buildFfmpegPlan(inputProject: Project, opts: { textOverlay?: Tex
     const asset = assetById.get(assetId)
     if (!asset) throw new Error(`Unknown asset ${assetId}`)
     const index = inputCount++
-    if (asset.kind === 'image') {
+    if (asset.kind === 'image' && /\.gif$/i.test(asset.path)) {
+      // The gif demuxer has no `-loop`/`-framerate` options ("Option loop not found"); loop
+      // the whole file instead, which also keeps animated GIFs animating like the preview.
+      inputs.push('-stream_loop', '-1', '-i', asset.path)
+    } else if (asset.kind === 'image') {
       inputs.push('-loop', '1', '-framerate', String(fps), '-i', asset.path)
     } else {
       inputs.push('-i', asset.path)
