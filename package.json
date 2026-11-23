@@ -3,6 +3,7 @@
   "productName": "anycut",
   "version": "0.1.0",
   "description": "A free, open-source desktop video editor inspired by CapCut.",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/Kngq/anycut.git"

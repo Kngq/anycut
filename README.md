@@ -13,6 +13,9 @@
   <a href="https://github.com/Kngq/anycut/releases/latest"><b>Download the latest release</b></a>
 </p>
 
+> [!NOTE]
+> **anycut is in beta.** Many features are still being built, and you may run into rough edges. Feedback, bug reports and contributions are all very welcome: [open an issue](https://github.com/Kngq/anycut/issues) or send a pull request.
+
 ![anycut editor](docs/screenshot.jpg)
 
 ## Download
@@ -54,7 +57,7 @@ iPhones record in HEVC, often in HDR (Dolby Vision). Converting those clips to H
 - **Look:** 15 colour filters with an intensity slider, effects (blur, shake, zoom, vignette, grain and more), transitions, crop, rotate, flip.
 - **Motion:** In / Out / Combo animations (zoom, slide, pop, shake, pulse…), keyframed position, scale and opacity, and optical-flow motion blur.
 - **Text and captions:** styled text, plus automatic captions transcribed on your machine (Whisper).
-- **Background removal:** on-device person/subject cut-out. No uploads.
+- **Background removal (early preview):** on-device person/subject cut-out. No uploads. The automatic masking is at a very early stage: it's slow on long clips and the edges aren't always clean yet.
 - **Media handling:** HDR footage is tone-mapped to SDR; preview proxies for heavy codecs (ProRes etc.); missing-media relinking; content-keyed cache you can clean from the app.
 - **Export:** H.264 MP4 rendered by ffmpeg, at the project's resolution and frame rate.
 
@@ -104,3 +107,11 @@ You can also start it from the repository's **Actions** tab → **Release** → 
 ## Notes
 
 anycut is an independent project. It is not affiliated with, endorsed by, or connected to CapCut or ByteDance, and it ships no CapCut code or assets. Its filters, effects and animations are its own implementations.
+
+## Contributing
+
+Bug reports, feature ideas and pull requests are appreciated. For anything bigger than a small fix, opening an issue first to talk it through is the easiest way to get it merged.
+
+## License
+
+anycut is released under the [MIT License](LICENSE). It bundles third-party software (FFmpeg, Electron, ONNX Runtime, ML models and fonts) under their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
